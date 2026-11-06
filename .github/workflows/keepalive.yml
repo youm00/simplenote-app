@@ -9,7 +9,9 @@ jobs:
     steps:
       - name: Query Supabase
         run: |
-          curl -fsS --retry 3 \
+          code=$(curl -sS -o /tmp/res.txt -w '%{http_code}' --retry 3 \
             "${{ secrets.SUPABASE_URL }}/rest/v1/notes?select=id&limit=1" \
-            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
-            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}"
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}")
+          echo "HTTP status: $code"
+          cat /tmp/res.txt
+          case "$code" in 2*) ;; *) exit 1 ;; esac
