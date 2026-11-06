@@ -1,0 +1,15 @@
+name: supabase-keepalive
+on:
+  schedule:
+    - cron: '0 0 * * *'   # 毎日 09:00 JST
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query Supabase
+        run: |
+          curl -fsS --retry 3 \
+            "${{ secrets.SUPABASE_URL }}/rest/v1/notes?select=id&limit=1" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}"
