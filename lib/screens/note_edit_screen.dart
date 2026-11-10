@@ -2,17 +2,22 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../dropbox_notes_service.dart';
 import '../notes_store.dart';
 
 class NoteEditScreen extends StatefulWidget {
   final NotesStore store;
   final String id;
   final bool isNew;
+
+  /// 検索結果から開いたときの検索語。本文の中で一致した部分を強調し、最初の一致箇所まで移動する。
+  final String searchQuery;
   const NoteEditScreen({
     super.key,
     required this.store,
     required this.id,
     this.isNew = false,
+    this.searchQuery = '',
   });
 
   @override
@@ -21,15 +26,26 @@ class NoteEditScreen extends StatefulWidget {
 
 class _NoteEditScreenState extends State<NoteEditScreen>
     with WidgetsBindingObserver {
-  final _c = TextEditingController();
+  final _c = _HighlightController();
+  final _scroll = ScrollController();
   Timer? _timer;
   bool _loaded = false;
   bool _dirty = false;
   String? _loadError;
 
+  // 本文内検索(検索結果から開いたとき)
+  String _query = ''; // 強調する検索語。空なら、強調も案内バーも出さない
+  int _cur = 0; // いま選んでいる一致箇所(0始まり)
+  // 一致箇所へのスクロール位置の計算に使う、本文欄の大きさと文字スタイル
+  double _fieldW = 0;
+  double _fieldH = 0;
+  TextStyle? _fieldStyle;
+  TextScaler _textScaler = TextScaler.noScaling;
+
   @override
   void initState() {
     super.initState();
+    _query = widget.searchQuery.trim();
     WidgetsBinding.instance.addObserver(this);
     _load();
   }
@@ -39,9 +55,14 @@ class _NoteEditScreenState extends State<NoteEditScreen>
       final t = await widget.store.loadContent(widget.id);
       if (!mounted) return;
       _c.text = t;
+      _c.setHighlight(_query, 0);
       setState(() {
         _loaded = true;
         _loadError = null;
+      });
+      // 本文欄が表示されて、大きさが決まったあとで、最初の一致箇所へ移動する
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _jumpToFirstMatch();
       });
     } catch (e) {
       if (!mounted) return;
@@ -90,6 +111,7 @@ class _NoteEditScreenState extends State<NoteEditScreen>
       }
     }
     _c.dispose();
+    _scroll.dispose();
     super.dispose();
   }
 
@@ -128,8 +150,185 @@ class _NoteEditScreenState extends State<NoteEditScreen>
     Navigator.pop(context);
   }
 
+  /// タグを追加するダイアログを開く。
+  /// 新規ノートで、まだ一度も保存されていない場合は、先に本文を保存してからタグを付ける。
+  Future<void> _addTag() async {
+    final store = widget.store;
+    if (store.metaOf(widget.id) == null) {
+      if (_c.text.trim().isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('先に本文を入力してください')),
+        );
+        return;
+      }
+      _dirty = true;
+      _flush(); // saveContent が同期的にメタ情報を作る
+    }
+    final have = (store.metaOf(widget.id)?.tags ?? const <String>[])
+        .map((t) => t.toLowerCase())
+        .toSet();
+    final suggestions = store
+        .tagCounts(trash: false)
+        .where((t) => !have.contains(t.key))
+        .map((t) => t.label)
+        .toList();
+
+    final res = await showDialog<List<String>>(
+      context: context,
+      builder: (_) => _TagDialog(suggestions: suggestions),
+    );
+    if (res == null || res.isEmpty || !mounted) return;
+    store.addTags(widget.id, res);
+  }
+
+  // ── 本文内検索 ───────────────────────────────────────────────
+
+  /// 本文の中で、検索語に一致する位置(文字のオフセット)を、先頭から順に返す。
+  /// 一覧の強調表示と同じ規則(大文字小文字は区別しない、重ならない一致のみ)。
+  List<int> _matchStarts() {
+    if (_query.isEmpty) return const [];
+    final text = _c.text;
+    final lower = text.toLowerCase();
+    if (lower.length != text.length) return const [];
+    final q = _query.toLowerCase();
+    final out = <int>[];
+    var i = 0;
+    while (true) {
+      final j = lower.indexOf(q, i);
+      if (j < 0) break;
+      out.add(j);
+      i = j + q.length;
+    }
+    return out;
+  }
+
+  void _jumpToFirstMatch() {
+    final starts = _matchStarts();
+    if (starts.isEmpty) return;
+    _scrollToOffset(starts[0], animate: false);
+  }
+
+  /// 一致箇所を、前(-1)・次(+1)へ移す。端まで行ったら、反対側に戻る。
+  void _gotoMatch(int delta) {
+    final starts = _matchStarts();
+    if (starts.isEmpty) return;
+    final n = starts.length;
+    setState(() => _cur = ((_cur + delta) % n + n) % n);
+    _c.setHighlight(_query, _cur);
+    _scrollToOffset(starts[_cur]);
+  }
+
+  void _closeSearchBar() {
+    setState(() => _query = '');
+    _c.setHighlight('', 0);
+  }
+
+  /// 本文の [offset] 文字目が、画面の上から3分の1あたりに来るように、スクロールする。
+  /// 同じ幅・同じ文字スタイルで文字を配置し直して、その行の高さを求めている。
+  void _scrollToOffset(int offset, {bool animate = true}) {
+    final style = _fieldStyle;
+    if (style == null || !_scroll.hasClients || _fieldW <= 0) return;
+    // 文字を置ける幅は、本文欄の幅より、カーソルの分(約3px)だけ狭い
+    final tp = TextPainter(
+      text: TextSpan(text: _c.text, style: style),
+      textDirection: TextDirection.ltr,
+      textScaler: _textScaler,
+    )..layout(maxWidth: (_fieldW - 3).clamp(1.0, double.infinity).toDouble());
+    final y = tp.getOffsetForCaret(TextPosition(offset: offset), Rect.zero).dy;
+    tp.dispose();
+    final pos = _scroll.position;
+    final target = (y - _fieldH / 3).clamp(0.0, pos.maxScrollExtent).toDouble();
+    if (animate) {
+      _scroll.animateTo(
+        target,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    } else {
+      _scroll.jumpTo(target);
+    }
+  }
+
+  /// 「「gmail」 3 / 12」と、前へ・次へ・閉じるのボタン
+  Widget _searchBar() {
+    if (_query.isEmpty) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    final n = _matchStarts().length;
+    final cur = n == 0 ? 0 : _cur.clamp(0, n - 1);
+    return Container(
+      margin: const EdgeInsets.only(top: 4, bottom: 4),
+      padding: const EdgeInsets.only(left: 12),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              n == 0 ? '本文に「$_query」はありません' : '「$_query」  ${cur + 1} / $n',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 13),
+            ),
+          ),
+          IconButton(
+            tooltip: '前の一致箇所',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.keyboard_arrow_up),
+            onPressed: n == 0 ? null : () => _gotoMatch(-1),
+          ),
+          IconButton(
+            tooltip: '次の一致箇所',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.keyboard_arrow_down),
+            onPressed: n == 0 ? null : () => _gotoMatch(1),
+          ),
+          IconButton(
+            tooltip: '強調を消す',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.close),
+            onPressed: _closeSearchBar,
+          ),
+        ],
+      ),
+    );
+  }
+
   // ── 画面 ─────────────────────────────────────────────────────
-  Widget _body(bool deleted) {
+  Widget _tagBar(NoteMeta? meta, bool deleted) {
+    final tags = meta?.tags ?? const <String>[];
+    if (deleted && tags.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 4, bottom: 4),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Wrap(
+          spacing: 8,
+          runSpacing: 0,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            for (final t in tags)
+              InputChip(
+                label: Text('#$t'),
+                visualDensity: VisualDensity.compact,
+                onDeleted:
+                    deleted ? null : () => widget.store.removeTag(widget.id, t),
+              ),
+            if (!deleted)
+              ActionChip(
+                avatar: const Icon(Icons.add, size: 18),
+                label: const Text('タグ'),
+                visualDensity: VisualDensity.compact,
+                onPressed: _addTag,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _body(bool deleted, NoteMeta? meta) {
     if (_loadError != null) {
       return Center(
         child: Column(
@@ -149,20 +348,46 @@ class _NoteEditScreenState extends State<NoteEditScreen>
       );
     }
     if (!_loaded) return const Center(child: CircularProgressIndicator());
+    final scheme = Theme.of(context).colorScheme;
+    // 本文の欄と、一致箇所へのスクロール位置の計算で、同じ文字スタイルを使う
+    final fieldStyle =
+        (Theme.of(context).textTheme.bodyLarge ?? const TextStyle(fontSize: 16))
+            .copyWith(color: scheme.onSurface);
+    _fieldStyle = fieldStyle;
+    _textScaler = MediaQuery.textScalerOf(context);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
-      child: TextField(
-        controller: _c,
-        onChanged: _onChanged,
-        maxLines: null,
-        expands: true,
-        textAlignVertical: TextAlignVertical.top,
-        autofocus: widget.isNew,
-        readOnly: deleted,
-        decoration: const InputDecoration(
-          border: InputBorder.none,
-          hintText: '1行目がタイトルになります',
-        ),
+      child: Column(
+        children: [
+          _tagBar(meta, deleted),
+          _searchBar(),
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, c) {
+                // 上下の余白(8 + 8)を除いた、文字が表示される領域の大きさ
+                _fieldW = c.maxWidth;
+                _fieldH = c.maxHeight - 16;
+                return TextField(
+                  controller: _c,
+                  scrollController: _scroll,
+                  style: fieldStyle,
+                  onChanged: _onChanged,
+                  maxLines: null,
+                  expands: true,
+                  textAlignVertical: TextAlignVertical.top,
+                  autofocus: widget.isNew,
+                  readOnly: deleted,
+                  decoration: const InputDecoration(
+                    border: InputBorder.none,
+                    isDense: true,
+                    contentPadding: EdgeInsets.symmetric(vertical: 8),
+                    hintText: '1行目がタイトルになります',
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -208,12 +433,140 @@ class _NoteEditScreenState extends State<NoteEditScreen>
             child: Center(
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 800),
-                child: _body(deleted),
+                child: _body(deleted, meta),
               ),
             ),
           ),
         );
       },
     );
+  }
+}
+
+/// タグ追加ダイアログ。
+/// 入力欄にカンマ・スペース区切りで複数入力できる。既存のタグは候補として表示し、タップで即追加。
+class _TagDialog extends StatefulWidget {
+  final List<String> suggestions;
+  const _TagDialog({required this.suggestions});
+
+  @override
+  State<_TagDialog> createState() => _TagDialogState();
+}
+
+class _TagDialogState extends State<_TagDialog> {
+  final _c = TextEditingController();
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final tags = parseTags(_c.text);
+    Navigator.pop(context, tags.isEmpty ? null : tags);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('タグを追加'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _c,
+              autofocus: true,
+              textInputAction: TextInputAction.done,
+              onSubmitted: (_) => _submit(),
+              decoration: const InputDecoration(
+                hintText: 'スペースかカンマ区切りで複数可',
+              ),
+            ),
+            if (widget.suggestions.isNotEmpty) ...[
+              const SizedBox(height: 16),
+              Text('既存のタグ', style: Theme.of(context).textTheme.bodySmall),
+              const SizedBox(height: 4),
+              Wrap(
+                spacing: 8,
+                children: [
+                  for (final s in widget.suggestions)
+                    ActionChip(
+                      label: Text('#$s'),
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => Navigator.pop(context, [s]),
+                    ),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('キャンセル')),
+        TextButton(onPressed: _submit, child: const Text('追加')),
+      ],
+    );
+  }
+}
+
+/// 検索語に一致した部分を、背景色で強調する本文用のコントローラ。
+/// いま選んでいる一致箇所(current)は、ほかより濃い色で表示する。
+class _HighlightController extends TextEditingController {
+  String _query = '';
+  int _current = 0;
+
+  void setHighlight(String query, int current) {
+    _query = query;
+    _current = current;
+    notifyListeners(); // 本文欄の再描画だけが走る(本文は変わらない)
+  }
+
+  @override
+  TextSpan buildTextSpan({
+    required BuildContext context,
+    TextStyle? style,
+    required bool withComposing,
+  }) {
+    // 日本語入力の変換中は、変換の下線を優先して、強調はしない
+    if (_query.isEmpty || (withComposing && value.isComposingRangeValid)) {
+      return super.buildTextSpan(
+          context: context, style: style, withComposing: withComposing);
+    }
+    final text = this.text;
+    final lower = text.toLowerCase();
+    final q = _query.toLowerCase();
+    if (lower.length != text.length) {
+      return super.buildTextSpan(
+          context: context, style: style, withComposing: withComposing);
+    }
+    final scheme = Theme.of(context).colorScheme;
+    final spans = <TextSpan>[];
+    var i = 0;
+    var index = 0;
+    while (true) {
+      final j = lower.indexOf(q, i);
+      if (j < 0) {
+        spans.add(TextSpan(text: text.substring(i)));
+        break;
+      }
+      if (j > i) spans.add(TextSpan(text: text.substring(i, j)));
+      final isCurrent = index == _current;
+      spans.add(TextSpan(
+        text: text.substring(j, j + q.length),
+        style: TextStyle(
+          backgroundColor:
+              isCurrent ? scheme.primary : scheme.tertiaryContainer,
+          color: isCurrent ? scheme.onPrimary : scheme.onTertiaryContainer,
+        ),
+      ));
+      i = j + q.length;
+      index++;
+    }
+    return TextSpan(style: style, children: spans);
   }
 }

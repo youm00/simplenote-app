@@ -1,14 +1,17 @@
 // dropbox_notes_service.dart
 //
 // Dropbox 上のレイアウト(アプリフォルダ配下):
-//   /simplenote/index.json        … 全ノートのメタ情報(タイトル・プレビュー・ピン・ゴミ箱・日時)
+//   /simplenote/index.json        … 全ノートのメタ情報(タイトル・プレビュー・ピン・ゴミ箱・日時)と、タグの並び順(tagOrder)
 //   /simplenote/notes/<id>.txt    … ノート本文(プレーンテキスト)
+//
+// 全文検索用に、全ノートの本文を ZIP で一括取得する (downloadAllNotes)。
 //
 // index.json の更新は Dropbox の rev を使った楽観的ロックで行い、
 // 他の端末と同時に更新して競合した場合は、取得し直して自分の変更だけを再適用する。
 
 import 'dart:convert';
 
+import 'package:archive/archive.dart';
 import 'package:http/http.dart' as http;
 
 import 'dropbox_auth_service.dart';
@@ -131,10 +134,18 @@ String previewOf(String text) {
   return String.fromCharCodes(rest.runes.take(300));
 }
 
+/// notes フォルダにある本文ファイル1つ分の情報(index.json の復旧用)
+class NoteFileInfo {
+  final String id;
+  final int modifiedMs; // ファイルの更新日時 (ms)
+  const NoteFileInfo(this.id, this.modifiedMs);
+}
+
 class IndexSnapshot {
   final String? rev; // index.json の Dropbox rev (未作成なら null)
   final Map<String, NoteMeta> notes;
-  IndexSnapshot(this.rev, this.notes);
+  final List<String> tagOrder; // ドロワーのタグの並び順(小文字化したタグ名)。未設定なら空
+  IndexSnapshot(this.rev, this.notes, [this.tagOrder = const []]);
   factory IndexSnapshot.empty() => IndexSnapshot(null, {});
 }
 
@@ -171,7 +182,7 @@ class DropboxNotesService {
       },
       body: jsonEncode({'path': _indexPath}),
     );
-    if (resp.statusCode == 409) return null; // 未作成
+    if (resp.statusCode == 409 && resp.body.contains('not_found')) return null; // 未作成
     if (resp.statusCode != 200) {
       throw Exception('metadata error ${resp.statusCode}: ${resp.body}');
     }
@@ -188,7 +199,9 @@ class DropboxNotesService {
         'Dropbox-API-Arg': jsonEncode({'path': _indexPath}),
       },
     );
-    if (resp.statusCode == 409) return IndexSnapshot.empty(); // 未作成
+    if (resp.statusCode == 409 && resp.body.contains('not_found')) {
+      return IndexSnapshot.empty(); // 未作成
+    }
     if (resp.statusCode != 200) {
       throw Exception('index download error ${resp.statusCode}: ${resp.body}');
     }
@@ -201,24 +214,29 @@ class DropboxNotesService {
     rev ??= await indexRev(); // ヘッダーが読めない環境向けの保険
 
     final notes = <String, NoteMeta>{};
+    var order = <String>[];
     final text = utf8.decode(resp.bodyBytes);
     if (text.trim().isNotEmpty) {
       final data = jsonDecode(text) as Map<String, dynamic>;
+      order = ((data['tagOrder'] as List?) ?? const [])
+          .map((e) => e.toString())
+          .toList();
       final raw = (data['notes'] as Map?) ?? const {};
       raw.forEach((k, v) {
         notes[k as String] =
             NoteMeta.fromJson(k, Map<String, dynamic>.from(v as Map));
       });
     }
-    return IndexSnapshot(rev, notes);
+    return IndexSnapshot(rev, notes, order);
   }
 
   Future<IndexSnapshot> _uploadIndex(
-      Map<String, NoteMeta> notes, String? rev) async {
+      Map<String, NoteMeta> notes, String? rev, List<String> order) async {
     final token = await _token();
     final body = jsonEncode({
       'v': 1,
       'notes': notes.map((k, v) => MapEntry(k, v.toJson())),
+      if (order.isNotEmpty) 'tagOrder': order,
     });
     final resp = await http.post(
       Uri.parse('https://content.dropboxapi.com/2/files/upload'),
@@ -241,21 +259,25 @@ class DropboxNotesService {
       throw Exception('index upload error ${resp.statusCode}: ${resp.body}');
     }
     final newRev = (jsonDecode(resp.body) as Map<String, dynamic>)['rev'] as String?;
-    return IndexSnapshot(newRev, notes);
+    return IndexSnapshot(newRev, notes, order);
   }
 
   /// index.json を「読み → 変更 → 書き」で更新する。競合したら最新を取得し直して再適用。
   Future<IndexSnapshot> mutateIndex(
     void Function(Map<String, NoteMeta> notes) mutate, {
     IndexSnapshot? base,
+    List<String> Function(List<String> order)? mutateOrder,
   }) async {
     var snap = base;
     for (var attempt = 0; attempt < 5; attempt++) {
       snap ??= await fetchIndex();
       final notes = Map<String, NoteMeta>.from(snap.notes);
       mutate(notes);
+      // タグの並び順は、指定がなければ、取得した最新のものをそのまま書き戻す(消さない)
+      final order =
+          mutateOrder != null ? mutateOrder(snap.tagOrder) : snap.tagOrder;
       try {
-        return await _uploadIndex(notes, snap.rev);
+        return await _uploadIndex(notes, snap.rev, order);
       } on ConflictException {
         snap = null; // 取得し直して再試行
       }
@@ -274,8 +296,79 @@ class DropboxNotesService {
       },
     );
     if (resp.statusCode == 200) return utf8.decode(resp.bodyBytes);
-    if (resp.statusCode == 409) return ''; // ファイルなし
+    if (resp.statusCode == 409 && resp.body.contains('not_found')) {
+      return ''; // ファイルなし
+    }
     throw Exception('note download error ${resp.statusCode}: ${resp.body}');
+  }
+
+  /// 全ノートの本文を、ZIP 1回でまとめて取得する (全文検索用)。 id -> 本文
+  /// notes フォルダがまだ無い場合は、空を返す。
+  Future<Map<String, String>> downloadAllNotes() async {
+    final token = await _token();
+    final resp = await http.post(
+      Uri.parse('https://content.dropboxapi.com/2/files/download_zip'),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Dropbox-API-Arg': jsonEncode({'path': _notesDir}),
+      },
+    );
+    if (resp.statusCode == 409 && resp.body.contains('not_found')) {
+      return {};
+    }
+    if (resp.statusCode != 200) {
+      throw Exception('notes zip error ${resp.statusCode}: ${resp.body}');
+    }
+    final archive = ZipDecoder().decodeBytes(resp.bodyBytes);
+    final out = <String, String>{};
+    for (final f in archive) {
+      if (!f.isFile) continue;
+      final name = f.name.split('/').last;
+      if (!name.endsWith('.txt')) continue;
+      final id = name.substring(0, name.length - 4);
+      out[id] = utf8.decode(f.content as List<int>, allowMalformed: true);
+    }
+    return out;
+  }
+
+  /// notes フォルダにある本文ファイルの一覧(ID と更新日時)。フォルダが無ければ空。
+  Future<List<NoteFileInfo>> listNoteFiles() async {
+    final token = await _token();
+    final out = <NoteFileInfo>[];
+    String? cursor;
+    while (true) {
+      final resp = await http.post(
+        Uri.parse(cursor == null
+            ? 'https://api.dropboxapi.com/2/files/list_folder'
+            : 'https://api.dropboxapi.com/2/files/list_folder/continue'),
+        headers: {
+          'Authorization': 'Bearer $token',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode(cursor == null
+            ? {'path': _notesDir, 'limit': 2000}
+            : {'cursor': cursor}),
+      );
+      if (resp.statusCode == 409 && resp.body.contains('not_found')) return out;
+      if (resp.statusCode != 200) {
+        throw Exception('notes list error ${resp.statusCode}: ${resp.body}');
+      }
+      final data = jsonDecode(resp.body) as Map<String, dynamic>;
+      for (final e in (data['entries'] as List)) {
+        final m = e as Map<String, dynamic>;
+        if (m['.tag'] != 'file') continue;
+        final name = m['name'] as String;
+        if (!name.endsWith('.txt')) continue;
+        final t = DateTime.tryParse(
+            (m['server_modified'] ?? m['client_modified'] ?? '') as String);
+        out.add(NoteFileInfo(
+          name.substring(0, name.length - 4),
+          (t ?? DateTime.now()).millisecondsSinceEpoch,
+        ));
+      }
+      if (data['has_more'] != true) return out;
+      cursor = data['cursor'] as String;
+    }
   }
 
   Future<void> saveNote(String id, String text) async {
@@ -309,8 +402,12 @@ class DropboxNotesService {
       },
       body: jsonEncode({'path': _notePath(id)}),
     );
-    // 409 = すでに存在しない → OK 扱い
-    if (resp.statusCode != 200 && resp.statusCode != 409) {
+    // 409 のうち、「すでに存在しない」(not_found)だけを、OK 扱いにする。
+    // 書き込みの混雑(too_many_write_operations)など、ほかの409は、エラーにして、あとで再試行させる
+    // (エラーにしないと、本文ファイルが残ったまま、一覧からだけ消えてしまう)。
+    final alreadyGone =
+        resp.statusCode == 409 && resp.body.contains('not_found');
+    if (resp.statusCode != 200 && !alreadyGone) {
       throw Exception('note delete error ${resp.statusCode}: ${resp.body}');
     }
   }

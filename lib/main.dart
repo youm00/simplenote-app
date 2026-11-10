@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'app_theme.dart';
 import 'dropbox_auth_service.dart';
 import 'dropbox_notes_service.dart';
 import 'notes_store.dart';
@@ -14,14 +15,14 @@ Future<void> main() async {
   final prefs = await SharedPreferences.getInstance();
   runApp(NotesApp(
     auth: auth,
-    initialDark: prefs.getBool('sn_dark_mode') ?? true,
+    initialTheme: loadThemeKind(prefs),
   ));
 }
 
 class NotesApp extends StatefulWidget {
   final DropboxAuthService auth;
-  final bool initialDark;
-  const NotesApp({super.key, required this.auth, required this.initialDark});
+  final AppThemeKind initialTheme;
+  const NotesApp({super.key, required this.auth, required this.initialTheme});
 
   static _NotesAppState of(BuildContext context) =>
       context.findAncestorStateOfType<_NotesAppState>()!;
@@ -31,12 +32,13 @@ class NotesApp extends StatefulWidget {
 }
 
 class _NotesAppState extends State<NotesApp> {
-  late bool isDark = widget.initialDark;
+  late AppThemeKind themeKind = widget.initialTheme;
 
-  Future<void> toggleTheme() async {
-    setState(() => isDark = !isDark);
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('sn_dark_mode', isDark);
+  /// テーマを切り替えて、保存する(設定画面から呼ばれる)
+  Future<void> setTheme(AppThemeKind k) async {
+    if (k == themeKind) return;
+    setState(() => themeKind = k);
+    await saveThemeKind(k);
   }
 
   @override
@@ -44,21 +46,7 @@ class _NotesAppState extends State<NotesApp> {
     return MaterialApp(
       title: 'Notes',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF5C6BC0),
-          brightness: Brightness.light,
-        ),
-        useMaterial3: true,
-      ),
-      darkTheme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF5C6BC0),
-          brightness: Brightness.dark,
-        ),
-        useMaterial3: true,
-      ),
-      themeMode: isDark ? ThemeMode.dark : ThemeMode.light,
+      theme: buildTheme(themeKind),
       home: AuthGate(auth: widget.auth),
     );
   }
@@ -126,6 +114,7 @@ class _AuthGateState extends State<AuthGate> {
   }
 
   Future<void> _logout() async {
+    await _store?.clearLocalData(); // 端末内に保存したノートも消す(ほかのアカウントに見えないように)
     await widget.auth.signOut();
     final old = _store;
     if (!mounted) return;
