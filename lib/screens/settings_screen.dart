@@ -1,10 +1,10 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../app_theme.dart';
+import '../backup_files.dart';
 import '../backup_format.dart';
 import '../main.dart';
 import '../notes_store.dart';
@@ -42,13 +42,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final d = DateTime.now();
       final name = 'simplenote_backup_${d.year}${_two(d.month)}${_two(d.day)}'
           '_${_two(d.hour)}${_two(d.minute)}${_two(d.second)}.json';
-      final saved = await FilePicker.saveFile(
-        dialogTitle: 'バックアップの保存先',
-        fileName: name,
-        bytes: Uint8List.fromList(utf8.encode(json)),
-        mimeType: 'application/json',
-      );
-      if (saved == null) {
+      final saved =
+          await saveBackupFile(name, Uint8List.fromList(utf8.encode(json)));
+      if (!saved) {
         _snack('保存をキャンセルしました');
       } else {
         _snack('${data.notes.length}件のノートを書き出しました');
@@ -64,15 +60,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _import() async {
     setState(() => _busy = true);
     try {
-      final file = await FilePicker.pickFile(
-        dialogTitle: 'バックアップファイルを選択',
-        type: FileType.any,
-      );
-      if (file == null) return; // キャンセル
+      final bytes = await pickBackupFile();
+      if (bytes == null) return; // キャンセル
 
       final BackupData data;
       try {
-        data = parseBackup(utf8.decode(await file.readAsBytes()));
+        data = parseBackup(utf8.decode(bytes));
       } on FormatException catch (e) {
         _snack('読み込めません: ${e.message}');
         return;
