@@ -5,6 +5,15 @@ import 'package:flutter/material.dart';
 import '../dropbox_notes_service.dart';
 import '../notes_store.dart';
 
+String _two(int v) => v.toString().padLeft(2, '0');
+
+/// 「2026年11月11日 19:48」の形。日時が不明(0 以下)のときは「—」。
+String _fmtDateTime(int ms) {
+  if (ms <= 0) return '—';
+  final d = DateTime.fromMillisecondsSinceEpoch(ms);
+  return '${d.year}年${d.month}月${d.day}日 ${_two(d.hour)}:${_two(d.minute)}';
+}
+
 class NoteEditScreen extends StatefulWidget {
   final NotesStore store;
   final String id;
@@ -12,12 +21,24 @@ class NoteEditScreen extends StatefulWidget {
 
   /// 検索結果から開いたときの検索語。本文の中で一致した部分を強調し、最初の一致箇所まで移動する。
   final String searchQuery;
+
+  /// 広い画面で、右側の編集部分として埋め込むとき true。
+  /// 戻るボタンは出さず、ゴミ箱へ・復元・完全削除のあとは [onClose] を呼ぶ(画面を閉じる代わり)。
+  final bool embedded;
+  final VoidCallback? onClose;
+
+  /// 埋め込みのとき、上部バーの左端に出すウィジェット(一覧の表示/非表示のボタン)
+  final Widget? leading;
+
   const NoteEditScreen({
     super.key,
     required this.store,
     required this.id,
     this.isNew = false,
     this.searchQuery = '',
+    this.embedded = false,
+    this.onClose,
+    this.leading,
   });
 
   @override
@@ -116,15 +137,25 @@ class _NoteEditScreenState extends State<NoteEditScreen>
   }
 
   // ── 操作 ─────────────────────────────────────────────────────
+
+  /// 編集を終える。全画面のときは画面を閉じ、埋め込みのときは、親に閉じてもらう。
+  void _close() {
+    if (widget.embedded) {
+      widget.onClose?.call();
+    } else {
+      Navigator.pop(context);
+    }
+  }
+
   void _toTrash() {
     _flush();
     widget.store.setDeleted(widget.id, true);
-    Navigator.pop(context);
+    _close();
   }
 
   void _restore() {
     widget.store.setDeleted(widget.id, false);
-    Navigator.pop(context);
+    _close();
   }
 
   Future<void> _deleteForever() async {
@@ -147,7 +178,52 @@ class _NoteEditScreenState extends State<NoteEditScreen>
     _timer?.cancel();
     _dirty = false;
     widget.store.removeForever(widget.id);
-    Navigator.pop(context);
+    _close();
+  }
+
+  /// ノートの情報(最終同期・更新・作成・単語数・文字数)を出す。
+  void _showInfo() {
+    final meta = widget.store.metaOf(widget.id);
+    if (meta == null) return;
+    final text = _c.text;
+    final words = text.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).length;
+    final chars = text.runes.length;
+    final synced = widget.store.lastSynced;
+
+    Widget row(String label, String value) => Padding(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          child: Row(
+            children: [
+              Expanded(child: Text(label)),
+              Text(value),
+            ],
+          ),
+        );
+
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('ノートの情報'),
+        content: SizedBox(
+          width: 320,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              row('最終同期',
+                  synced == null ? '—' : _fmtDateTime(synced.millisecondsSinceEpoch)),
+              row('更新', _fmtDateTime(meta.contentAt)),
+              row('作成', _fmtDateTime(meta.createdAt)),
+              row('単語数', '$words'),
+              row('文字数', '$chars'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('閉じる')),
+        ],
+      ),
+    );
   }
 
   /// タグを追加するダイアログを開く。
@@ -402,7 +478,16 @@ class _NoteEditScreenState extends State<NoteEditScreen>
         final pinned = meta?.pinned ?? false;
         return Scaffold(
           appBar: AppBar(
+            // 埋め込みのときは、戻るボタンを出さない(左端には、一覧の表示/非表示のボタンを出す)
+            automaticallyImplyLeading: !widget.embedded,
+            leading: widget.embedded ? widget.leading : null,
             actions: [
+              if (meta != null)
+                IconButton(
+                  tooltip: 'ノートの情報',
+                  icon: const Icon(Icons.info_outline),
+                  onPressed: _showInfo,
+                ),
               if (meta != null)
                 IconButton(
                   tooltip: 'ピン留め',

@@ -5,6 +5,16 @@ import 'note_edit_screen.dart';
 import 'settings_screen.dart';
 import 'tag_manage_screen.dart';
 
+// ── 広い画面(3列表示)の設定 ─────────────────────────────────
+/// この幅(論理ピクセル)以上のとき、ドロワー・一覧・編集を横に並べる
+const double _wideBreakpoint = 1000;
+
+/// 左のドロワー(常時表示)の幅
+const double _drawerPaneWidth = 260;
+
+/// 中央のノート一覧の幅
+const double _listPaneWidth = 360;
+
 String _two(int v) => v.toString().padLeft(2, '0');
 
 String _fmtTime(DateTime d) => '${_two(d.hour)}:${_two(d.minute)}:${_two(d.second)}';
@@ -172,7 +182,13 @@ class _NotesListScreenState extends State<NotesListScreen>
 
   _View _view = _View.all;
   String? _tag; // _view == tag のときの、タグのキー(小文字化したもの)
-  bool _searching = false;
+  bool _searching = false; // 狭い画面での、検索欄の表示(広い画面では、検索欄は常に出る)
+
+  // 広い画面で、右側に開いているノート
+  String? _openId;
+  bool _openNew = false;
+  String _openQuery = ''; // 検索結果から開いたときの検索語(本文内の強調に使う)
+  bool _listVisible = true; // 広い画面で、ノート一覧を表示しているか
 
   @override
   void initState() {
@@ -198,14 +214,48 @@ class _NotesListScreenState extends State<NotesListScreen>
   }
 
   // ── 操作 ─────────────────────────────────────────────────────
-  void _create(List<String> initialTags) {
+
+  /// ノートを開く。広い画面では右側の編集部分に出し、狭い画面では編集画面を重ねる。
+  void _openNote(
+    String id, {
+    required bool wide,
+    bool isNew = false,
+    String query = '',
+  }) {
+    if (wide) {
+      setState(() {
+        _openId = id;
+        _openNew = isNew;
+        _openQuery = query;
+      });
+    } else {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => NoteEditScreen(
+            store: widget.store,
+            id: id,
+            isNew: isNew,
+            searchQuery: query,
+          ),
+        ),
+      );
+    }
+  }
+
+  void _create(List<String> initialTags, {required bool wide}) {
     final id = widget.store.createNote(tags: initialTags);
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => NoteEditScreen(store: widget.store, id: id, isNew: true),
-      ),
-    );
+    _openNote(id, wide: wide, isNew: true);
+  }
+
+  /// 広い画面で、右側の編集部分を閉じる(ゴミ箱へ・復元・完全削除のあと)
+  void _closeEditor() {
+    if (!mounted) return;
+    setState(() {
+      _openId = null;
+      _openNew = false;
+      _openQuery = '';
+    });
   }
 
   void _select(_View v, {String? tag}) {
@@ -308,71 +358,101 @@ class _NotesListScreenState extends State<NotesListScreen>
     );
   }
 
-  Widget _drawer(List<TagCount> tags, _View view, String? tagKey) {
+  /// ドロワーの中身。狭い画面では Drawer の中に、広い画面では左の列に、同じものを出す。
+  Widget _drawerList(List<TagCount> tags, _View view, String? tagKey) {
     final scheme = Theme.of(context).colorScheme;
-    return Drawer(
-      child: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.symmetric(vertical: 8),
-          children: [
-            _drawerItem(
-              icon: Icons.library_books_outlined,
-              label: 'すべてのノート',
-              selected: view == _View.all,
-              onTap: () => _select(_View.all),
-            ),
-            _drawerItem(
-              icon: Icons.delete_outline,
-              label: 'ゴミ箱',
-              selected: view == _View.trash,
-              onTap: () => _select(_View.trash),
-            ),
-            _drawerItem(
-              icon: Icons.settings_outlined,
-              label: '設定',
-              selected: false,
-              onTap: _openSettings,
-            ),
-            const Divider(height: 24),
-            Padding(
-              padding: const EdgeInsets.only(left: 28, right: 12),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      'タグ',
-                      style: TextStyle(color: scheme.onSurfaceVariant),
-                    ),
-                  ),
-                  TextButton(
-                    onPressed: _openTagManage,
-                    child: const Text('編集'),
-                  ),
-                ],
-              ),
-            ),
-            if (tags.isEmpty)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(28, 8, 12, 8),
+    return ListView(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      children: [
+        _drawerItem(
+          icon: Icons.library_books_outlined,
+          label: 'すべてのノート',
+          selected: view == _View.all,
+          onTap: () => _select(_View.all),
+        ),
+        _drawerItem(
+          icon: Icons.delete_outline,
+          label: 'ゴミ箱',
+          selected: view == _View.trash,
+          onTap: () => _select(_View.trash),
+        ),
+        _drawerItem(
+          icon: Icons.settings_outlined,
+          label: '設定',
+          selected: false,
+          onTap: _openSettings,
+        ),
+        const Divider(height: 24),
+        Padding(
+          padding: const EdgeInsets.only(left: 28, right: 12),
+          child: Row(
+            children: [
+              Expanded(
                 child: Text(
-                  'タグはまだありません',
-                  style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
+                  'タグ',
+                  style: TextStyle(color: scheme.onSurfaceVariant),
                 ),
               ),
-            for (final t in tags)
-              _drawerItem(
-                label: t.label,
-                selected: view == _View.tag && tagKey == t.key,
-                onTap: () => _select(_View.tag, tag: t.key),
+              TextButton(
+                onPressed: _openTagManage,
+                child: const Text('編集'),
               ),
-            const Divider(height: 24),
-            _drawerItem(
-              icon: Icons.label_off_outlined,
-              label: 'タグがつけられていないメモ',
-              selected: view == _View.untagged,
-              onTap: () => _select(_View.untagged),
+            ],
+          ),
+        ),
+        if (tags.isEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(28, 8, 12, 8),
+            child: Text(
+              'タグはまだありません',
+              style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
             ),
-          ],
+          ),
+        for (final t in tags)
+          _drawerItem(
+            label: t.label,
+            selected: view == _View.tag && tagKey == t.key,
+            onTap: () => _select(_View.tag, tag: t.key),
+          ),
+        const Divider(height: 24),
+        _drawerItem(
+          icon: Icons.label_off_outlined,
+          label: 'タグがつけられていないメモ',
+          selected: view == _View.untagged,
+          onTap: () => _select(_View.untagged),
+        ),
+      ],
+    );
+  }
+
+  /// 広い画面で、一覧の上に常に出す検索欄
+  Widget _wideSearchField() {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      child: TextField(
+        controller: _searchC,
+        onChanged: (_) => setState(() {}),
+        decoration: InputDecoration(
+          hintText: '検索(本文・タイトル・タグ)',
+          isDense: true,
+          filled: true,
+          fillColor: scheme.surfaceContainerHighest,
+          prefixIcon: const Icon(Icons.search),
+          suffixIcon: _searchC.text.isEmpty
+              ? null
+              : IconButton(
+                  tooltip: 'クリア',
+                  icon: const Icon(Icons.close),
+                  onPressed: () {
+                    _searchC.clear();
+                    setState(() {});
+                  },
+                ),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(24),
+            borderSide: BorderSide.none,
+          ),
         ),
       ),
     );
@@ -382,68 +462,104 @@ class _NotesListScreenState extends State<NotesListScreen>
   @override
   Widget build(BuildContext context) {
     final store = widget.store;
-    return ListenableBuilder(
-      listenable: store,
-      builder: (context, _) {
-        final tags = store.orderedTags(); // 並べ替えた順
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final wide = constraints.maxWidth >= _wideBreakpoint;
+        return ListenableBuilder(
+          listenable: store,
+          builder: (context, _) {
+            final tags = store.orderedTags(); // 並べ替えた順
 
-        // 選んでいたタグが、もう使われていなければ「すべてのノート」に戻す
-        var view = _view;
-        String? tagKey = _tag;
-        if (view == _View.tag && !tags.any((t) => t.key == tagKey)) {
-          view = _View.all;
-          tagKey = null;
-        }
-        final trash = view == _View.trash;
-        final activeTag = view == _View.tag
-            ? tags.firstWhere((t) => t.key == tagKey)
-            : null;
+            // 選んでいたタグが、もう使われていなければ「すべてのノート」に戻す
+            var view = _view;
+            String? tagKey = _tag;
+            if (view == _View.tag && !tags.any((t) => t.key == tagKey)) {
+              view = _View.all;
+              tagKey = null;
+            }
+            final trash = view == _View.trash;
+            final activeTag = view == _View.tag
+                ? tags.firstWhere((t) => t.key == tagKey)
+                : null;
 
-        final notes = store.visibleNotes(
-          trash: trash,
-          query: _searchC.text,
-          tag: activeTag?.key,
-          untaggedOnly: view == _View.untagged,
-        );
+            // 広い画面では、検索欄が常に出る。狭い画面では、検索欄を開いているときだけ。
+            final query = (wide || _searching) ? _searchC.text : '';
+            final q = query.trim();
 
-        final title = switch (view) {
-          _View.all => 'すべてのノート',
-          _View.trash => 'ゴミ箱',
-          _View.untagged => 'タグがつけられていないメモ',
-          _View.tag => activeTag!.label,
-        };
+            final notes = store.visibleNotes(
+              trash: trash,
+              query: query,
+              tag: activeTag?.key,
+              untaggedOnly: view == _View.untagged,
+            );
 
-        final scheme = Theme.of(context).colorScheme;
-        final unsent =
-            store.pendingCount > 0 ? '未送信の変更 ${store.pendingCount}件 / ' : '';
-        final syncTip = unsent +
-            (store.error ??
-                (store.offline
-                    ? 'オフライン(つながったら、自動で同期します)'
-                    : store.lastSynced == null
-                        ? '同期中…'
-                        : '最終同期 ${_fmtTime(store.lastSynced!)}'));
+            final title = switch (view) {
+              _View.all => 'すべてのノート',
+              _View.trash => 'ゴミ箱',
+              _View.untagged => 'タグがつけられていないメモ',
+              _View.tag => activeTag!.label,
+            };
 
-        return PopScope(
-          canPop: !_searching,
-          onPopInvokedWithResult: (didPop, _) {
-            if (!didPop) _closeSearch();
-          },
-          child: Scaffold(
-            key: _scaffoldKey,
-            drawer: _drawer(tags, view, tagKey),
-            appBar: AppBar(
-              leading: _searching
-                  ? IconButton(
-                      icon: const Icon(Icons.arrow_back),
-                      onPressed: _closeSearch,
-                    )
-                  : IconButton(
-                      tooltip: 'メニュー',
-                      icon: const Icon(Icons.menu),
-                      onPressed: () => _scaffoldKey.currentState?.openDrawer(),
-                    ),
-              title: _searching
+            final scheme = Theme.of(context).colorScheme;
+            final unsent = store.pendingCount > 0
+                ? '未送信の変更 ${store.pendingCount}件 / '
+                : '';
+            final syncTip = unsent +
+                (store.error ??
+                    (store.offline
+                        ? 'オフライン(つながったら、自動で同期します)'
+                        : store.lastSynced == null
+                            ? '同期中…'
+                            : '最終同期 ${_fmtTime(store.lastSynced!)}'));
+
+            // 広い画面で開いているノートが、もう無いとき(ほかの端末で削除された、など)は、閉じる
+            final openId = _openId;
+            if (wide &&
+                openId != null &&
+                !_openNew &&
+                store.metaOf(openId) == null) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (mounted && _openId == openId) _closeEditor();
+              });
+            }
+
+            // ── 一覧の上部バー ──
+            final emptyTrashButton = (trash && notes.isNotEmpty)
+                ? IconButton(
+                    tooltip: 'ゴミ箱を空にする',
+                    icon: const Icon(Icons.delete_sweep_outlined),
+                    onPressed: () async {
+                      if (await _confirm('ゴミ箱を空にしますか？', 'この操作は元に戻せません。') &&
+                          mounted) {
+                        store.emptyTrash();
+                      }
+                    },
+                  )
+                : null;
+            final syncButton = IconButton(
+              tooltip: syncTip,
+              icon: Icon((store.error != null || store.offline)
+                  ? Icons.cloud_off
+                  : Icons.cloud_done_outlined),
+              onPressed: () => store.refresh(force: true),
+            );
+
+            final appBar = AppBar(
+              automaticallyImplyLeading: false,
+              leading: wide
+                  ? null
+                  : (_searching
+                      ? IconButton(
+                          icon: const Icon(Icons.arrow_back),
+                          onPressed: _closeSearch,
+                        )
+                      : IconButton(
+                          tooltip: 'メニュー',
+                          icon: const Icon(Icons.menu),
+                          onPressed: () =>
+                              _scaffoldKey.currentState?.openDrawer(),
+                        )),
+              title: (!wide && _searching)
                   ? TextField(
                       controller: _searchC,
                       autofocus: true,
@@ -455,7 +571,7 @@ class _NotesListScreenState extends State<NotesListScreen>
                     )
                   : Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
               actions: [
-                if (_searching) ...[
+                if (!wide && _searching) ...[
                   if (_searchC.text.isNotEmpty)
                     IconButton(
                       tooltip: 'クリア',
@@ -466,145 +582,230 @@ class _NotesListScreenState extends State<NotesListScreen>
                       },
                     ),
                 ] else ...[
-                  if (trash && notes.isNotEmpty)
+                  if (emptyTrashButton != null) emptyTrashButton,
+                  syncButton,
+                  if (wide)
                     IconButton(
-                      tooltip: 'ゴミ箱を空にする',
-                      icon: const Icon(Icons.delete_sweep_outlined),
-                      onPressed: () async {
-                        if (await _confirm('ゴミ箱を空にしますか？', 'この操作は元に戻せません。') &&
-                            mounted) {
-                          store.emptyTrash();
-                        }
-                      },
+                      tooltip: '新規ノート',
+                      icon: const Icon(Icons.edit_square),
+                      onPressed: trash
+                          ? null
+                          : () => _create(
+                                activeTag == null
+                                    ? const <String>[]
+                                    : [activeTag.label],
+                                wide: true,
+                              ),
+                    )
+                  else
+                    IconButton(
+                      tooltip: '検索',
+                      icon: const Icon(Icons.search),
+                      onPressed: _openSearch,
                     ),
-                  IconButton(
-                    tooltip: syncTip,
-                    icon: Icon((store.error != null || store.offline)
-                        ? Icons.cloud_off
-                        : Icons.cloud_done_outlined),
-                    onPressed: () => store.refresh(force: true),
-                  ),
-                  IconButton(
-                    tooltip: '検索',
-                    icon: const Icon(Icons.search),
-                    onPressed: _openSearch,
-                  ),
                 ],
               ],
-            ),
-            floatingActionButton: trash
-                ? null
-                : FloatingActionButton(
-                    shape: const CircleBorder(),
-                    onPressed: () => _create(
-                      activeTag == null ? const <String>[] : [activeTag.label],
+            );
+
+            // ── 一覧の本体 ──
+            final listBody = Column(
+              children: [
+                if (wide) _wideSearchField(),
+                if (store.error != null)
+                  Container(
+                    width: double.infinity,
+                    color: scheme.errorContainer,
+                    padding: const EdgeInsets.all(8),
+                    child: Text(
+                      store.error!,
+                      style: TextStyle(
+                          color: scheme.onErrorContainer, fontSize: 12),
                     ),
-                    child: const Icon(Icons.edit_square),
                   ),
-            body: SafeArea(
-              child: Center(
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 800),
-                  child: Column(
-                    children: [
-                      if (store.error != null)
-                        Container(
-                          width: double.infinity,
-                          color: scheme.errorContainer,
-                          padding: const EdgeInsets.all(8),
-                          child: Text(
-                            store.error!,
-                            style: TextStyle(
-                                color: scheme.onErrorContainer, fontSize: 12),
-                          ),
-                        ),
-                      if (_searching &&
-                          _searchC.text.trim().isNotEmpty &&
-                          !store.fullTextReady)
-                        _FullTextBanner(syncing: store.contentSyncing),
-                      if (store.indexProblem != null)
-                        _IndexProblemBanner(
-                          store: store,
-                          problem: store.indexProblem!,
-                        ),
-                      Expanded(
-                        child: store.loading && notes.isEmpty
-                            ? const Center(child: CircularProgressIndicator())
-                            : RefreshIndicator(
-                                onRefresh: () => store.refresh(force: true),
-                                child: notes.isEmpty
-                                    ? ListView(
-                                        physics:
-                                            const AlwaysScrollableScrollPhysics(),
-                                        children: const [
-                                          SizedBox(height: 120),
-                                          Center(child: Text('ノートはありません')),
-                                        ],
-                                      )
-                                    : ListView.builder(
-                                        physics:
-                                            const AlwaysScrollableScrollPhysics(),
-                                        padding:
-                                            const EdgeInsets.only(bottom: 88),
-                                        itemCount: notes.length,
-                                        itemBuilder: (context, i) {
-                                          final n = notes[i];
-                                          // 検索語が本文にだけあるときは、その前後を抜粋して表示する
-                                          final q = _searchC.text.trim();
-                                          final snippet = q.isEmpty
-                                              ? null
-                                              : store.bodySnippet(n.id, q);
-                                          final subText = snippet ?? n.preview;
-                                          final hasPreview = subText.isNotEmpty;
-                                          return ListTile(
-                                            contentPadding:
-                                                const EdgeInsets.symmetric(
-                                                    horizontal: 16, vertical: 6),
-                                            isThreeLine: hasPreview,
-                                            title: _hlText(
-                                              n.title.isEmpty ? '(無題)' : n.title,
+                if (q.isNotEmpty && !store.fullTextReady)
+                  _FullTextBanner(syncing: store.contentSyncing),
+                if (store.indexProblem != null)
+                  _IndexProblemBanner(
+                    store: store,
+                    problem: store.indexProblem!,
+                  ),
+                Expanded(
+                  child: store.loading && notes.isEmpty
+                      ? const Center(child: CircularProgressIndicator())
+                      : RefreshIndicator(
+                          onRefresh: () => store.refresh(force: true),
+                          child: notes.isEmpty
+                              ? ListView(
+                                  physics: const AlwaysScrollableScrollPhysics(),
+                                  children: const [
+                                    SizedBox(height: 120),
+                                    Center(child: Text('ノートはありません')),
+                                  ],
+                                )
+                              : ListView.builder(
+                                  physics: const AlwaysScrollableScrollPhysics(),
+                                  padding: const EdgeInsets.only(bottom: 88),
+                                  itemCount: notes.length,
+                                  itemBuilder: (context, i) {
+                                    final n = notes[i];
+                                    // 検索語が本文にだけあるときは、その前後を抜粋して表示する
+                                    final snippet = q.isEmpty
+                                        ? null
+                                        : store.bodySnippet(n.id, q);
+                                    final subText = snippet ?? n.preview;
+                                    final hasPreview = subText.isNotEmpty;
+                                    final isOpen = wide && n.id == _openId;
+                                    return ListTile(
+                                      tileColor: isOpen
+                                          ? scheme.secondaryContainer
+                                          : null,
+                                      contentPadding:
+                                          const EdgeInsets.symmetric(
+                                              horizontal: 16, vertical: 6),
+                                      isThreeLine: hasPreview,
+                                      title: _hlText(
+                                        n.title.isEmpty ? '(無題)' : n.title,
+                                        q,
+                                        hlColor: scheme.tertiaryContainer,
+                                        hlTextColor:
+                                            scheme.onTertiaryContainer,
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .titleMedium
+                                            ?.copyWith(
+                                                fontWeight: FontWeight.bold),
+                                      ),
+                                      subtitle: hasPreview
+                                          ? _hlText(
+                                              subText,
                                               q,
                                               hlColor: scheme.tertiaryContainer,
-                                              hlTextColor: scheme.onTertiaryContainer,
-                                              style: Theme.of(context)
-                                                  .textTheme
-                                                  .titleMedium
-                                                  ?.copyWith(fontWeight: FontWeight.bold),
-                                            ),
-                                            subtitle: hasPreview
-                                                ? _hlText(
-                                                    subText,
-                                                    q,
-                                                    hlColor: scheme.tertiaryContainer,
-                                                    hlTextColor: scheme.onTertiaryContainer,
-                                                    maxLines: 2,
-                                                  )
-                                                : null,
-                                            trailing: n.pinned
-                                                ? const Icon(Icons.push_pin,
-                                                    size: 18)
-                                                : null,
-                                            onTap: () => Navigator.push(
-                                              context,
-                                              MaterialPageRoute(
-                                                builder: (_) => NoteEditScreen(
-                                                  store: store,
-                                                  id: n.id,
-                                                  searchQuery: q, // 検索中なら、本文内の一致箇所を強調
-                                                ),
-                                              ),
-                                            ),
-                                          );
-                                        },
+                                              hlTextColor:
+                                                  scheme.onTertiaryContainer,
+                                              maxLines: 2,
+                                            )
+                                          : null,
+                                      trailing: n.pinned
+                                          ? const Icon(Icons.push_pin, size: 18)
+                                          : null,
+                                      // 検索中なら、本文内の一致箇所を強調する
+                                      onTap: () => _openNote(
+                                        n.id,
+                                        wide: wide,
+                                        query: q,
                                       ),
-                              ),
-                      ),
-                    ],
-                  ),
+                                    );
+                                  },
+                                ),
+                        ),
                 ),
+              ],
+            );
+
+            // ── 一覧(狭い画面ではドロワーと新規ボタンつき) ──
+            final listScaffold = Scaffold(
+              key: _scaffoldKey,
+              drawer: wide
+                  ? null
+                  : Drawer(
+                      child: SafeArea(child: _drawerList(tags, view, tagKey)),
+                    ),
+              appBar: appBar,
+              floatingActionButton: (wide || trash)
+                  ? null
+                  : FloatingActionButton(
+                      shape: const CircleBorder(),
+                      onPressed: () => _create(
+                        activeTag == null
+                            ? const <String>[]
+                            : [activeTag.label],
+                        wide: false,
+                      ),
+                      child: const Icon(Icons.edit_square),
+                    ),
+              body: wide
+                  ? SafeArea(child: listBody)
+                  : SafeArea(
+                      child: Center(
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 800),
+                          child: listBody,
+                        ),
+                      ),
+                    ),
+            );
+
+            // ── 狭い画面: これまでどおり ──
+            if (!wide) {
+              return PopScope(
+                canPop: !_searching,
+                onPopInvokedWithResult: (didPop, _) {
+                  if (!didPop) _closeSearch();
+                },
+                child: listScaffold,
+              );
+            }
+
+            // ── 広い画面: ドロワー | 一覧 | 編集 ──
+            final toggleButton = IconButton(
+              tooltip: _listVisible ? 'ノート一覧を隠す' : 'ノート一覧を表示',
+              icon: const Icon(Icons.view_sidebar_outlined),
+              onPressed: () => setState(() => _listVisible = !_listVisible),
+            );
+            final editorPane = openId == null
+                ? Scaffold(
+                    appBar: AppBar(
+                      automaticallyImplyLeading: false,
+                      leading: toggleButton,
+                    ),
+                    body: Center(
+                      child: Text(
+                        'ノートを選択してください',
+                        style: TextStyle(color: scheme.onSurfaceVariant),
+                      ),
+                    ),
+                  )
+                : NoteEditScreen(
+                    // ノートを切り替えたときは、編集画面を作り直す(前のノートは、そのとき保存される)
+                    key: ValueKey('$openId|$_openQuery'),
+                    store: store,
+                    id: openId,
+                    isNew: _openNew,
+                    searchQuery: _openQuery,
+                    embedded: true,
+                    onClose: _closeEditor,
+                    leading: toggleButton,
+                  );
+
+            final divider = VerticalDivider(
+              width: 1,
+              thickness: 1,
+              color: scheme.outlineVariant,
+            );
+
+            return Scaffold(
+              body: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SizedBox(
+                    width: _drawerPaneWidth,
+                    child: Material(
+                      color: scheme.surfaceContainerLow,
+                      child: SafeArea(
+                        child: _drawerList(tags, view, tagKey),
+                      ),
+                    ),
+                  ),
+                  divider,
+                  if (_listVisible) ...[
+                    SizedBox(width: _listPaneWidth, child: listScaffold),
+                    divider,
+                  ],
+                  Expanded(child: editorPane),
+                ],
               ),
-            ),
-          ),
+            );
+          },
         );
       },
     );
