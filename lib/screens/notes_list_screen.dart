@@ -563,7 +563,26 @@ class _NotesListScreenState extends State<NotesListScreen>
                       ),
                       onChanged: (_) => setState(() {}),
                     )
-                  : Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  // タイトルの右に、いま表示している一覧の件数を出す
+                  : Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Text(
+                          '${notes.length}',
+                          style: TextStyle(
+                            fontSize: 16,
+                            color: scheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
               actions: [
                 if (searchingNarrow) ...[
                   if (_searchC.text.isNotEmpty)
