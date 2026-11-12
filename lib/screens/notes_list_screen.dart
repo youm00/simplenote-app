@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../notes_store.dart';
 import 'note_edit_screen.dart';
@@ -9,8 +10,15 @@ import 'tag_manage_screen.dart';
 /// この幅(論理ピクセル)以上のとき、ノート一覧と編集を横に並べる
 const double _wideBreakpoint = 1000;
 
-/// 左のノート一覧の幅
-const double _listPaneWidth = 360;
+/// 左のノート一覧の幅の初期値(境の線をドラッグして変えられる)
+const double _listPaneDefaultWidth = 360;
+
+/// 左のノート一覧の幅の下限と、編集側に最低限残す幅
+const double _listPaneMinWidth = 240;
+const double _editorPaneMinWidth = 400;
+
+/// 一覧の幅を保存する SharedPreferences のキー
+const String _listWidthKey = 'sn_list_width';
 
 String _two(int v) => v.toString().padLeft(2, '0');
 
@@ -160,6 +168,56 @@ class _FullTextBanner extends StatelessWidget {
   }
 }
 
+/// 一覧と編集の境の線。マウスで左右にドラッグして、一覧の幅を変えられる。
+/// 見える線は1pxだが、つかみやすいように、操作できる範囲は左右に広げてある。
+class _PaneDivider extends StatefulWidget {
+  final void Function(double dx) onDrag;
+  final VoidCallback onDragEnd;
+  const _PaneDivider({required this.onDrag, required this.onDragEnd});
+
+  @override
+  State<_PaneDivider> createState() => _PaneDividerState();
+}
+
+class _PaneDividerState extends State<_PaneDivider> {
+  bool _hover = false;
+  bool _dragging = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final active = _hover || _dragging;
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeColumn,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onHorizontalDragStart: (_) => setState(() => _dragging = true),
+        onHorizontalDragUpdate: (d) => widget.onDrag(d.delta.dx),
+        onHorizontalDragEnd: (_) {
+          setState(() => _dragging = false);
+          widget.onDragEnd();
+        },
+        onHorizontalDragCancel: () {
+          setState(() => _dragging = false);
+          widget.onDragEnd();
+        },
+        child: SizedBox(
+          width: 9, // つかめる範囲
+          child: Center(
+            child: Container(
+              // 触れている間・ドラッグ中は、線を太く、アクセント色にする
+              width: active ? 3 : 1,
+              color: active ? scheme.primary : scheme.outlineVariant,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// 一覧に表示する対象(ドロワーで切り替える)
 enum _View { all, trash, untagged, tag }
 
@@ -186,10 +244,14 @@ class _NotesListScreenState extends State<NotesListScreen>
   bool _openNew = false;
   String _openQuery = ''; // 検索結果から開いたときの検索語(本文内の強調に使う)
 
+  // 広い画面での、一覧の幅(境の線をドラッグして変える。端末に保存する)
+  double _listWidth = _listPaneDefaultWidth;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _loadListWidth();
   }
 
   @override
@@ -197,6 +259,28 @@ class _NotesListScreenState extends State<NotesListScreen>
     WidgetsBinding.instance.removeObserver(this);
     _searchC.dispose();
     super.dispose();
+  }
+
+  // ── 一覧の幅の保存 ───────────────────────────────────────────
+  Future<void> _loadListWidth() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final w = prefs.getDouble(_listWidthKey);
+      if (w != null && mounted) {
+        setState(() => _listWidth = w < _listPaneMinWidth ? _listPaneMinWidth : w);
+      }
+    } catch (_) {
+      // 読めなければ、初期値のまま
+    }
+  }
+
+  Future<void> _saveListWidth() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(_listWidthKey, _listWidth);
+    } catch (_) {
+      // 保存できなくても、動作は止めない
+    }
   }
 
   // アプリに戻ってきたら、すぐ同期する
@@ -460,6 +544,14 @@ class _NotesListScreenState extends State<NotesListScreen>
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= _wideBreakpoint;
+
+        // 一覧の幅: 下限と「編集側に残す幅」の範囲に収める(ウィンドウを狭めたときも、はみ出さない)
+        final maxListWidth = (constraints.maxWidth - _editorPaneMinWidth)
+            .clamp(_listPaneMinWidth, double.infinity)
+            .toDouble();
+        final listWidth =
+            _listWidth.clamp(_listPaneMinWidth, maxListWidth).toDouble();
+
         return ListenableBuilder(
           listenable: store,
           builder: (context, _) {
@@ -768,11 +860,15 @@ class _NotesListScreenState extends State<NotesListScreen>
               content = Row(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  SizedBox(width: _listPaneWidth, child: listScaffold),
-                  VerticalDivider(
-                    width: 1,
-                    thickness: 1,
-                    color: scheme.outlineVariant,
+                  SizedBox(width: listWidth, child: listScaffold),
+                  // 境の線: 左右にドラッグして、一覧の幅を変える
+                  _PaneDivider(
+                    onDrag: (dx) => setState(() {
+                      _listWidth = (listWidth + dx)
+                          .clamp(_listPaneMinWidth, maxListWidth)
+                          .toDouble();
+                    }),
+                    onDragEnd: _saveListWidth,
                   ),
                   Expanded(child: editorPane),
                 ],

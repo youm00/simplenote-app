@@ -24,6 +24,7 @@ class NoteEditScreen extends StatefulWidget {
 
   /// 広い画面で、右側の編集部分として埋め込むとき true。
   /// 戻るボタンは出さず、ゴミ箱へ・復元・完全削除のあとは [onClose] を呼ぶ(画面を閉じる代わり)。
+  /// 埋め込みのときは、タグの行を、本文の上ではなく、上部バーに出す。
   final bool embedded;
   final VoidCallback? onClose;
 
@@ -372,6 +373,28 @@ class _NoteEditScreenState extends State<NoteEditScreen>
   }
 
   // ── 画面 ─────────────────────────────────────────────────────
+
+  /// タグのチップ(タグごとの × と、「+ タグ」)。本文の上(狭い画面)と上部バー(広い画面)で共通。
+  List<Widget> _tagChips(NoteMeta? meta, bool deleted) {
+    final tags = meta?.tags ?? const <String>[];
+    return [
+      for (final t in tags)
+        InputChip(
+          label: Text('#$t'),
+          visualDensity: VisualDensity.compact,
+          onDeleted: deleted ? null : () => widget.store.removeTag(widget.id, t),
+        ),
+      if (!deleted)
+        ActionChip(
+          avatar: const Icon(Icons.add, size: 18),
+          label: const Text('タグ'),
+          visualDensity: VisualDensity.compact,
+          onPressed: _addTag,
+        ),
+    ];
+  }
+
+  /// 本文の上に出すタグの行(狭い画面用)
   Widget _tagBar(NoteMeta? meta, bool deleted) {
     final tags = meta?.tags ?? const <String>[];
     if (deleted && tags.isEmpty) return const SizedBox.shrink();
@@ -383,23 +406,26 @@ class _NoteEditScreenState extends State<NoteEditScreen>
           spacing: 8,
           runSpacing: 0,
           crossAxisAlignment: WrapCrossAlignment.center,
-          children: [
-            for (final t in tags)
-              InputChip(
-                label: Text('#$t'),
-                visualDensity: VisualDensity.compact,
-                onDeleted:
-                    deleted ? null : () => widget.store.removeTag(widget.id, t),
-              ),
-            if (!deleted)
-              ActionChip(
-                avatar: const Icon(Icons.add, size: 18),
-                label: const Text('タグ'),
-                visualDensity: VisualDensity.compact,
-                onPressed: _addTag,
-              ),
-          ],
+          children: _tagChips(meta, deleted),
         ),
+      ),
+    );
+  }
+
+  /// 上部バーに出すタグの行(広い画面用)。多いときは横にスクロールする。
+  Widget? _appBarTags(NoteMeta? meta, bool deleted) {
+    final tags = meta?.tags ?? const <String>[];
+    if (deleted && tags.isEmpty) return null;
+    final chips = _tagChips(meta, deleted);
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(
+        children: [
+          for (var i = 0; i < chips.length; i++) ...[
+            if (i > 0) const SizedBox(width: 8),
+            chips[i],
+          ],
+        ],
       ),
     );
   }
@@ -435,7 +461,8 @@ class _NoteEditScreenState extends State<NoteEditScreen>
       padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Column(
         children: [
-          _tagBar(meta, deleted),
+          // 広い画面(埋め込み)では、タグは上部バーに出すので、ここには出さない
+          if (!widget.embedded) _tagBar(meta, deleted),
           _searchBar(),
           Expanded(
             child: LayoutBuilder(
@@ -481,6 +508,9 @@ class _NoteEditScreenState extends State<NoteEditScreen>
             // 埋め込みのときは、戻るボタンを出さない(左端には、一覧の表示/非表示のボタンを出す)
             automaticallyImplyLeading: !widget.embedded,
             leading: widget.embedded ? widget.leading : null,
+            // 埋め込みのときは、タグの行を上部バーに出す(1行分、本文が広がる)
+            centerTitle: false,
+            title: widget.embedded ? _appBarTags(meta, deleted) : null,
             actions: [
               if (meta != null)
                 IconButton(
