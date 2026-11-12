@@ -5,14 +5,11 @@ import 'note_edit_screen.dart';
 import 'settings_screen.dart';
 import 'tag_manage_screen.dart';
 
-// ── 広い画面(3列表示)の設定 ─────────────────────────────────
-/// この幅(論理ピクセル)以上のとき、ドロワー・一覧・編集を横に並べる
+// ── 広い画面(2列表示)の設定 ─────────────────────────────────
+/// この幅(論理ピクセル)以上のとき、ノート一覧と編集を横に並べる
 const double _wideBreakpoint = 1000;
 
-/// 左のドロワー(常時表示)の幅
-const double _drawerPaneWidth = 260;
-
-/// 中央のノート一覧の幅
+/// 左のノート一覧の幅
 const double _listPaneWidth = 360;
 
 String _two(int v) => v.toString().padLeft(2, '0');
@@ -177,7 +174,7 @@ class NotesListScreen extends StatefulWidget {
 
 class _NotesListScreenState extends State<NotesListScreen>
     with WidgetsBindingObserver {
-  final _scaffoldKey = GlobalKey<ScaffoldState>();
+  final _scaffoldKey = GlobalKey<ScaffoldState>(); // ドロワーを開閉するための、外側の Scaffold
   final _searchC = TextEditingController();
 
   _View _view = _View.all;
@@ -188,7 +185,6 @@ class _NotesListScreenState extends State<NotesListScreen>
   String? _openId;
   bool _openNew = false;
   String _openQuery = ''; // 検索結果から開いたときの検索語(本文内の強調に使う)
-  bool _listVisible = true; // 広い画面で、ノート一覧を表示しているか
 
   @override
   void initState() {
@@ -358,7 +354,6 @@ class _NotesListScreenState extends State<NotesListScreen>
     );
   }
 
-  /// ドロワーの中身。狭い画面では Drawer の中に、広い画面では左の列に、同じものを出す。
   Widget _drawerList(List<TagCount> tags, _View view, String? tagKey) {
     final scheme = Theme.of(context).colorScheme;
     return ListView(
@@ -544,22 +539,21 @@ class _NotesListScreenState extends State<NotesListScreen>
               onPressed: () => store.refresh(force: true),
             );
 
+            final searchingNarrow = !wide && _searching;
+
             final appBar = AppBar(
               automaticallyImplyLeading: false,
-              leading: wide
-                  ? null
-                  : (_searching
-                      ? IconButton(
-                          icon: const Icon(Icons.arrow_back),
-                          onPressed: _closeSearch,
-                        )
-                      : IconButton(
-                          tooltip: 'メニュー',
-                          icon: const Icon(Icons.menu),
-                          onPressed: () =>
-                              _scaffoldKey.currentState?.openDrawer(),
-                        )),
-              title: (!wide && _searching)
+              leading: searchingNarrow
+                  ? IconButton(
+                      icon: const Icon(Icons.arrow_back),
+                      onPressed: _closeSearch,
+                    )
+                  : IconButton(
+                      tooltip: 'メニュー',
+                      icon: const Icon(Icons.menu),
+                      onPressed: () => _scaffoldKey.currentState?.openDrawer(),
+                    ),
+              title: searchingNarrow
                   ? TextField(
                       controller: _searchC,
                       autofocus: true,
@@ -571,7 +565,7 @@ class _NotesListScreenState extends State<NotesListScreen>
                     )
                   : Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
               actions: [
-                if (!wide && _searching) ...[
+                if (searchingNarrow) ...[
                   if (_searchC.text.isNotEmpty)
                     IconButton(
                       tooltip: 'クリア',
@@ -702,14 +696,8 @@ class _NotesListScreenState extends State<NotesListScreen>
               ],
             );
 
-            // ── 一覧(狭い画面ではドロワーと新規ボタンつき) ──
+            // ── 一覧(狭い画面では新規ボタンつき) ──
             final listScaffold = Scaffold(
-              key: _scaffoldKey,
-              drawer: wide
-                  ? null
-                  : Drawer(
-                      child: SafeArea(child: _drawerList(tags, view, tagKey)),
-                    ),
               appBar: appBar,
               floatingActionButton: (wide || trash)
                   ? null
@@ -735,74 +723,55 @@ class _NotesListScreenState extends State<NotesListScreen>
                     ),
             );
 
-            // ── 狭い画面: これまでどおり ──
-            if (!wide) {
-              return PopScope(
-                canPop: !_searching,
-                onPopInvokedWithResult: (didPop, _) {
-                  if (!didPop) _closeSearch();
-                },
-                child: listScaffold,
+            // ── 広い画面: 一覧 | 編集 ──
+            Widget content = listScaffold;
+            if (wide) {
+              final editorPane = openId == null
+                  ? Scaffold(
+                      appBar: AppBar(automaticallyImplyLeading: false),
+                      body: Center(
+                        child: Text(
+                          'ノートを選択してください',
+                          style: TextStyle(color: scheme.onSurfaceVariant),
+                        ),
+                      ),
+                    )
+                  : NoteEditScreen(
+                      // ノートを切り替えたときは、編集画面を作り直す(前のノートは、そのとき保存される)
+                      key: ValueKey('$openId|$_openQuery'),
+                      store: store,
+                      id: openId,
+                      isNew: _openNew,
+                      searchQuery: _openQuery,
+                      embedded: true,
+                      onClose: _closeEditor,
+                    );
+              content = Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SizedBox(width: _listPaneWidth, child: listScaffold),
+                  VerticalDivider(
+                    width: 1,
+                    thickness: 1,
+                    color: scheme.outlineVariant,
+                  ),
+                  Expanded(child: editorPane),
+                ],
               );
             }
 
-            // ── 広い画面: ドロワー | 一覧 | 編集 ──
-            final toggleButton = IconButton(
-              tooltip: _listVisible ? 'ノート一覧を隠す' : 'ノート一覧を表示',
-              icon: const Icon(Icons.view_sidebar_outlined),
-              onPressed: () => setState(() => _listVisible = !_listVisible),
-            );
-            final editorPane = openId == null
-                ? Scaffold(
-                    appBar: AppBar(
-                      automaticallyImplyLeading: false,
-                      leading: toggleButton,
-                    ),
-                    body: Center(
-                      child: Text(
-                        'ノートを選択してください',
-                        style: TextStyle(color: scheme.onSurfaceVariant),
-                      ),
-                    ),
-                  )
-                : NoteEditScreen(
-                    // ノートを切り替えたときは、編集画面を作り直す(前のノートは、そのとき保存される)
-                    key: ValueKey('$openId|$_openQuery'),
-                    store: store,
-                    id: openId,
-                    isNew: _openNew,
-                    searchQuery: _openQuery,
-                    embedded: true,
-                    onClose: _closeEditor,
-                    leading: toggleButton,
-                  );
-
-            final divider = VerticalDivider(
-              width: 1,
-              thickness: 1,
-              color: scheme.outlineVariant,
-            );
-
-            return Scaffold(
-              body: Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  SizedBox(
-                    width: _drawerPaneWidth,
-                    child: Material(
-                      color: scheme.surfaceContainerLow,
-                      child: SafeArea(
-                        child: _drawerList(tags, view, tagKey),
-                      ),
-                    ),
-                  ),
-                  divider,
-                  if (_listVisible) ...[
-                    SizedBox(width: _listPaneWidth, child: listScaffold),
-                    divider,
-                  ],
-                  Expanded(child: editorPane),
-                ],
+            // ドロワーは、外側の Scaffold に持たせる(ハンバーガーで開くと、一覧と編集の上に重なる)
+            return PopScope(
+              canPop: !searchingNarrow,
+              onPopInvokedWithResult: (didPop, _) {
+                if (!didPop) _closeSearch();
+              },
+              child: Scaffold(
+                key: _scaffoldKey,
+                drawer: Drawer(
+                  child: SafeArea(child: _drawerList(tags, view, tagKey)),
+                ),
+                body: content,
               ),
             );
           },
