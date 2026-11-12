@@ -26,12 +26,13 @@ Future<bool> saveBackupFile(String fileName, Uint8List bytes) async {
 }
 
 /// ブラウザのファイル選択を開いて、選んだファイルの中身を返す。キャンセルなら null。
+/// バックアップ(.json)のほか、本家 Simplenote の書き出し(.zip)も選べる。
 /// (ボタンを押した操作の直後に、呼び出すこと。await のあとでは、ブラウザに止められることがある)
 Future<Uint8List?> pickBackupFile() {
   final completer = Completer<Uint8List?>();
   final input = (web.document.createElement('input') as web.HTMLInputElement)
     ..type = 'file'
-    ..accept = '.json,application/json';
+    ..accept = '.json,.zip,application/json,application/zip';
 
   Future<void> read() async {
     try {

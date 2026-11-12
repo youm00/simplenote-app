@@ -8,9 +8,10 @@ import '../backup_files.dart';
 import '../backup_format.dart';
 import '../main.dart';
 import '../notes_store.dart';
+import '../simplenote_import.dart';
 
 /// 設定画面。ドロワーの「設定」から開く。
-/// テーマの選択、バックアップ(書き出し・読み込み)、ログアウト。
+/// テーマの選択、バックアップ(書き出し・読み込み)、本家 Simplenote からの取り込み、ログアウト。
 class SettingsScreen extends StatefulWidget {
   final NotesStore store;
   final Future<void> Function() onLogout;
@@ -56,8 +57,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
-  // ── バックアップの読み込み ───────────────────────────────────
-  Future<void> _import() async {
+  // ── 読み込み(このアプリのバックアップ / 本家 Simplenote の書き出し 共通) ──
+  /// ファイルを選び、[parse] で BackupData に変換して、確認ダイアログのあと、取り込む。
+  Future<void> _importFile(
+    BackupData Function(Uint8List bytes) parse, {
+    required String title,
+  }) async {
     setState(() => _busy = true);
     try {
       final bytes = await pickBackupFile();
@@ -65,7 +70,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
       final BackupData data;
       try {
-        data = parseBackup(utf8.decode(bytes));
+        data = parse(bytes);
       } on FormatException catch (e) {
         _snack('読み込めません: ${e.message}');
         return;
@@ -75,7 +80,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) return;
       final overwrite = await showDialog<bool>(
         context: context,
-        builder: (_) => _ImportDialog(preview: preview),
+        builder: (_) => _ImportDialog(title: title, preview: preview),
       );
       if (overwrite == null) return; // キャンセル
 
@@ -87,6 +92,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (mounted) setState(() => _busy = false);
     }
   }
+
+  Future<void> _import() => _importFile(
+        (bytes) => parseBackup(utf8.decode(bytes)),
+        title: 'バックアップを読み込む',
+      );
+
+  Future<void> _importSimplenote() => _importFile(
+        parseSimplenoteExport,
+        title: '本家 Simplenote から取り込む',
+      );
 
   // ── 一覧の作り直し ───────────────────────────────────────────
   Future<void> _rebuildIndex() async {
@@ -217,6 +232,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   onTap: _busy ? null : _rebuildIndex,
                 ),
                 const Divider(height: 24),
+                _sectionTitle('取り込み'),
+                ListTile(
+                  enabled: !_busy,
+                  leading: const Icon(Icons.move_to_inbox_outlined),
+                  title: const Text('本家 Simplenote から取り込む'),
+                  subtitle: const Text(
+                      '本家で書き出した ZIP(または notes.json)を選びます。ピン留めとタグの並び順は、書き出しに入っていないため、戻りません'),
+                  onTap: _busy ? null : _importSimplenote,
+                ),
+                const Divider(height: 24),
                 ListTile(
                   leading: const Icon(Icons.logout),
                   title: const Text('ログアウト'),
@@ -232,10 +257,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
 }
 
 /// 読み込み前の確認ダイアログ。
-/// 結果: null=キャンセル、false=追加だけ(いまのノートは変更しない)、true=バックアップの内容で上書き
+/// 結果: null=キャンセル、false=追加だけ(いまのノートは変更しない)、true=ファイルの内容で上書き
 class _ImportDialog extends StatelessWidget {
+  final String title;
   final BackupPreview preview;
-  const _ImportDialog({required this.preview});
+  const _ImportDialog({required this.title, required this.preview});
 
   @override
   Widget build(BuildContext context) {
@@ -252,7 +278,7 @@ class _ImportDialog extends StatelessWidget {
 
     final nothing = p.added == 0 && p.same == 0;
     return AlertDialog(
-      title: const Text('バックアップを読み込む'),
+      title: Text(title),
       content: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -264,7 +290,7 @@ class _ImportDialog extends StatelessWidget {
               const SizedBox(height: 12),
               Text('「追加だけ」: いまのノートは変更せず、足りないノートだけを戻します。', style: small),
               const SizedBox(height: 4),
-              Text('「上書き」: 同じノートも、バックアップの内容(本文・タグ・ピン・ゴミ箱)に戻します。',
+              Text('「上書き」: 同じノートも、ファイルの内容(本文・タグ・ピン・ゴミ箱)に戻します。',
                   style: small),
             ],
           ],
