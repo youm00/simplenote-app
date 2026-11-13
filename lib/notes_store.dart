@@ -13,8 +13,10 @@
 //  - バックアップ: 全ノートを JSON で書き出す(buildBackup)/読み込む(importBackup)。
 //    読み込んだノートは、本文ファイルを4件ずつ並行して送り、index.json は1回の更新でまとめて送る。
 //  - 自動バックアップ(v17): 同期が成功したあと、今日まだ取っていなければ、Dropbox の /backup/ に
-//    simplenote_backup_YYYYMMDD_HHmmss.json を保存する(1日1回、最大365件)。手動の保存(backupNow)と、
-//    Dropbox のバックアップの一覧・取得(listRemoteBackups / downloadRemoteBackup)も、ここから行う。
+//    simplenote_backup_YYYYMMDD_HHmmss.json を保存する(1日1回、最大365件)。
+//    ほかの端末が、今日すでに取っていたときは(backup フォルダに今日の日付のファイルがあるとき)、取らない。
+//    手動の保存(backupNow)と、Dropbox のバックアップの一覧・取得(listRemoteBackups / downloadRemoteBackup)も、
+//    ここから行う。
 //  - 全文検索: 全ノートの本文をメモリに持つ(_content)。起動後の最初の同期で、ZIP 1回でまとめて取得し、
 //    以降は、本文が更新されたノートだけを取り直す。取得中は、取得済みの分だけが検索対象になる。
 
@@ -105,9 +107,11 @@ class NotesStore extends ChangeNotifier {
   static const _backupDateKey = 'sn_cache_last_backup'; // ログアウトで、端末内の保存といっしょに消える
   static const _backupRetryWait = Duration(minutes: 10);
   bool _backingUp = false;
+  bool _backupChecking = false; // 「今日の分が、Dropbox にあるか」を確かめている最中
   DateTime? _backupFailAt; // 直近の自動バックアップの失敗の時刻(10分は再試行しない)
 
   /// 最後にバックアップに成功した日(「2026-11-13」の形)。まだ無ければ null。
+  /// ほかの端末が今日の分を取っていたと確かめたときも、その日になる。
   String? lastBackupDate;
 
   /// バックアップを保存している最中か
@@ -593,6 +597,7 @@ class NotesStore extends ChangeNotifier {
 
   /// いま、全ノートのバックアップを、Dropbox の /backup/ に保存する(手動・自動の共通)。
   /// 保存したノートの数を返す。失敗したら、例外。保存したあと、365件を超えた古い分を削除する。
+  /// ここでは、今日の分があるかどうかは確かめない(確かめるのは、自動のほう)。
   Future<int> backupNow() async {
     if (_backingUp) throw Exception('別のバックアップを実行中です');
     if (_notes.isEmpty) throw Exception('バックアップするノートがありません');
@@ -626,22 +631,45 @@ class NotesStore extends ChangeNotifier {
 
   /// 今日まだバックアップを取っていなければ、取る。同期が成功するたびに呼ばれる(起動時と、30秒ごと)。
   /// 次のときは、取らない: まだ一度も同期できていない / 未送信の変更がある / 一覧に問題がある /
-  /// ノートが無い / 今日はもう取った / 直前に失敗した(10分は待つ)。
+  /// ノートが無い / この端末が今日もう取った / 直前に失敗した(10分は待つ) /
+  /// ほかの端末が、今日すでに取っていた(Dropbox の backup フォルダに、今日の日付のファイルがある)。
   Future<void> _autoBackupIfNeeded() async {
-    if (_disposed || _backingUp || !_localReady) return;
+    if (_disposed || _backingUp || _backupChecking || !_localReady) return;
     if (!_fetchedOnce || _hasUnsent || _jobs > 0 || indexProblem != null) return;
     if (_notes.isEmpty) return;
-    if (lastBackupDate == _dateStr(DateTime.now())) return;
+    final today = _dateStr(DateTime.now());
+    if (lastBackupDate == today) return;
     final failed = _backupFailAt;
     if (failed != null &&
         DateTime.now().difference(failed) < _backupRetryWait) {
       return;
     }
+
+    // ほかの端末が、今日の分をすでに取っていないか、Dropbox で確かめる
+    _backupChecking = true;
+    try {
+      final list = await _svc.listBackups();
+      final doneToday = list.any((f) =>
+          _dateStr(DateTime.fromMillisecondsSinceEpoch(f.modifiedMs)) == today);
+      if (doneToday) {
+        await _recordBackupDate(today); // この端末は、今日は、もう確かめなくてよい
+        _notify();
+        return;
+      }
+    } catch (_) {
+      _backupFailAt = DateTime.now(); // 通信できないときなどは、静かに、あとでやり直す
+      return;
+    } finally {
+      _backupChecking = false;
+    }
+
+    // 確かめている間に、状況が変わっていないか、もう一度見る
+    if (_disposed || _backingUp || _hasUnsent || _jobs > 0) return;
     try {
       await backupNow();
       _backupFailAt = null;
     } catch (_) {
-      _backupFailAt = DateTime.now(); // 通信できないときなどは、静かに、あとでやり直す
+      _backupFailAt = DateTime.now();
     }
   }
 
