@@ -12,18 +12,32 @@
 //    起動時はこれを先に表示し、圏外で編集した分は、アプリを終了しても残り、つながったときに自動で送る。
 //  - バックアップ: 全ノートを JSON で書き出す(buildBackup)/読み込む(importBackup)。
 //    読み込んだノートは、本文ファイルを4件ずつ並行して送り、index.json は1回の更新でまとめて送る。
+//  - 自動バックアップ(v17): 同期が成功したあと、今日まだ取っていなければ、Dropbox の /backup/ に
+//    simplenote_backup_YYYYMMDD_HHmmss.json を保存する(1日1回、最大365件)。手動の保存(backupNow)と、
+//    Dropbox のバックアップの一覧・取得(listRemoteBackups / downloadRemoteBackup)も、ここから行う。
 //  - 全文検索: 全ノートの本文をメモリに持つ(_content)。起動後の最初の同期で、ZIP 1回でまとめて取得し、
 //    以降は、本文が更新されたノートだけを取り直す。取得中は、取得済みの分だけが検索対象になる。
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'backup_format.dart';
 import 'dropbox_notes_service.dart';
+
+String _two(int v) => v.toString().padLeft(2, '0');
+
+/// 「2026-11-13」の形(自動バックアップを、1日1回にするための日付)
+String _dateStr(DateTime d) => '${d.year}-${_two(d.month)}-${_two(d.day)}';
+
+/// 「simplenote_backup_20261113_104512.json」の形
+String _backupFileName(DateTime d) =>
+    'simplenote_backup_${d.year}${_two(d.month)}${_two(d.day)}'
+    '_${_two(d.hour)}${_two(d.minute)}${_two(d.second)}.json';
 
 /// タグ一覧用(ドロワー・タグ編集画面・候補表示に使う)
 class TagCount {
@@ -84,6 +98,20 @@ class NotesStore extends ChangeNotifier {
   DateTime? _contentFailAt; // 直近の取得失敗の時刻(5分は再試行しない)
   static const _contentRetryWait = Duration(minutes: 5);
   static const _zipThreshold = 8; // 取得が必要なノートがこの数以上なら、ZIP でまとめて取得
+
+  // 自動バックアップの状態(v17)
+  /// Dropbox に残すバックアップの最大件数(超えた分は、古い順に自動で削除する)
+  static const backupKeep = 365;
+  static const _backupDateKey = 'sn_cache_last_backup'; // ログアウトで、端末内の保存といっしょに消える
+  static const _backupRetryWait = Duration(minutes: 10);
+  bool _backingUp = false;
+  DateTime? _backupFailAt; // 直近の自動バックアップの失敗の時刻(10分は再試行しない)
+
+  /// 最後にバックアップに成功した日(「2026-11-13」の形)。まだ無ければ null。
+  String? lastBackupDate;
+
+  /// バックアップを保存している最中か
+  bool get backingUp => _backingUp;
 
   final Set<String> _dirty = {}; // 未同期の変更があるノート
   final Set<String> _fileDirty = {}; // 本文ファイルが未アップロード
@@ -561,12 +589,76 @@ class NotesStore extends ChangeNotifier {
     }
   }
 
+  // ── Dropbox へのバックアップ(v17) ────────────────────────────
+
+  /// いま、全ノートのバックアップを、Dropbox の /backup/ に保存する(手動・自動の共通)。
+  /// 保存したノートの数を返す。失敗したら、例外。保存したあと、365件を超えた古い分を削除する。
+  Future<int> backupNow() async {
+    if (_backingUp) throw Exception('別のバックアップを実行中です');
+    if (_notes.isEmpty) throw Exception('バックアップするノートがありません');
+    _backingUp = true;
+    _notify();
+    try {
+      final now = DateTime.now();
+      final data = await buildBackup();
+      final bytes = utf8.encode(encodeBackup(data));
+      await _svc.uploadBackup(_backupFileName(now), bytes);
+      await _recordBackupDate(_dateStr(now));
+      try {
+        await _svc.pruneBackups(keep: backupKeep); // 古い分の削除に失敗しても、バックアップ自体は成功
+      } catch (_) {}
+      return data.notes.length;
+    } finally {
+      _backingUp = false;
+      _notify();
+    }
+  }
+
+  /// 最後にバックアップした日を、記録する(端末内にも保存する)。
+  Future<void> _recordBackupDate(String d) async {
+    lastBackupDate = d;
+    if (!_localReady || _disposed) return; // ログアウト中などは、保存しない
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (_localReady && !_disposed) await prefs.setString(_backupDateKey, d);
+    } catch (_) {}
+  }
+
+  /// 今日まだバックアップを取っていなければ、取る。同期が成功するたびに呼ばれる(起動時と、30秒ごと)。
+  /// 次のときは、取らない: まだ一度も同期できていない / 未送信の変更がある / 一覧に問題がある /
+  /// ノートが無い / 今日はもう取った / 直前に失敗した(10分は待つ)。
+  Future<void> _autoBackupIfNeeded() async {
+    if (_disposed || _backingUp || !_localReady) return;
+    if (!_fetchedOnce || _hasUnsent || _jobs > 0 || indexProblem != null) return;
+    if (_notes.isEmpty) return;
+    if (lastBackupDate == _dateStr(DateTime.now())) return;
+    final failed = _backupFailAt;
+    if (failed != null &&
+        DateTime.now().difference(failed) < _backupRetryWait) {
+      return;
+    }
+    try {
+      await backupNow();
+      _backupFailAt = null;
+    } catch (_) {
+      _backupFailAt = DateTime.now(); // 通信できないときなどは、静かに、あとでやり直す
+    }
+  }
+
+  /// Dropbox の /backup/ にあるバックアップの一覧(新しい順)。
+  Future<List<BackupFileInfo>> listRemoteBackups() => _svc.listBackups();
+
+  /// Dropbox のバックアップファイルの中身を取得する(復元用)。
+  Future<Uint8List> downloadRemoteBackup(String path) =>
+      _svc.downloadBackup(path);
+
   // ── 端末内への保存(オフライン編集の永続化) ─────────────────────
   // 端末内(SharedPreferences)に、次のものを保存して、アプリを終了しても、圏外でも、使えるようにする。
   //   sn_cache_index   … 全ノートのメタ情報、本文の更新日時、タグの並び順
   //   sn_cache_c_<id>  … ノートの本文(キャッシュ。全文検索・圏外での閲覧に使う)
   //   sn_cache_pending … 未送信の変更。ノートごとのメタ情報と本文(本文を変えたものだけ)を、この1つのキーに
   //                      まとめて入れる。1回の書き込みで完結するので、途中で終了しても、編集が失われない。
+  //   sn_cache_last_backup … 最後に Dropbox へバックアップした日(v17)
   // 起動すると、まずこれを読み込んで画面に出し、そのあと Dropbox と同期する。
   static const _idxKey = 'sn_cache_index';
   static const _pendKey = 'sn_cache_pending';
@@ -596,6 +688,8 @@ class NotesStore extends ChangeNotifier {
   Future<void> _loadLocal() async {
     try {
       final prefs = await SharedPreferences.getInstance();
+
+      lastBackupDate = prefs.getString(_backupDateKey);
 
       // 一覧(メタ情報)と、本文のキャッシュ
       final rawIdx = prefs.getString(_idxKey);
@@ -874,6 +968,7 @@ class NotesStore extends ChangeNotifier {
           error = null;
           _markOnline();
           unawaited(_syncContents()); // 前回、取り切れなかった分があれば、続きを取得
+          unawaited(_autoBackupIfNeeded()); // 今日まだなら、バックアップ
           _notify();
           return;
         }
@@ -909,6 +1004,7 @@ class NotesStore extends ChangeNotifier {
       error = null;
       _markOnline();
       unawaited(_syncContents()); // 本文の取得は、裏で進める
+      unawaited(_autoBackupIfNeeded()); // 今日まだなら、バックアップ(未送信の変更があるときは、取らない)
       if (_hasUnsent) _retryPending(); // 圏外で溜めた変更を、ここで送る
     } catch (e) {
       if (_isNetworkError(e)) {

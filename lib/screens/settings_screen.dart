@@ -6,12 +6,28 @@ import 'package:flutter/material.dart';
 import '../app_theme.dart';
 import '../backup_files.dart';
 import '../backup_format.dart';
+import '../dropbox_notes_service.dart';
 import '../main.dart';
 import '../notes_store.dart';
 import '../simplenote_import.dart';
 
+String _two(int v) => v.toString().padLeft(2, '0');
+
+/// 「2026-11-13 10:45」の形
+String _fmtDt(int ms) {
+  final d = DateTime.fromMillisecondsSinceEpoch(ms);
+  return '${d.year}-${_two(d.month)}-${_two(d.day)} ${_two(d.hour)}:${_two(d.minute)}';
+}
+
+/// ファイルの大きさ(KB / MB)
+String _fmtSize(int bytes) {
+  if (bytes >= 1024 * 1024) return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB';
+  return '${(bytes / 1024).round()} KB';
+}
+
 /// 設定画面。ドロワーの「設定」から開く。
-/// テーマの選択、バックアップ(書き出し・読み込み)、本家 Simplenote からの取り込み、ログアウト。
+/// テーマの選択、バックアップ(書き出し・読み込み、Dropbox への自動バックアップと復元)、
+/// 本家 Simplenote からの取り込み、ログアウト。
 class SettingsScreen extends StatefulWidget {
   final NotesStore store;
   final Future<void> Function() onLogout;
@@ -23,8 +39,6 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   bool _busy = false; // バックアップの処理中
-
-  String _two(int v) => v.toString().padLeft(2, '0');
 
   void _snack(String msg) {
     if (!mounted) return;
@@ -57,15 +71,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
-  // ── 読み込み(このアプリのバックアップ / 本家 Simplenote の書き出し 共通) ──
-  /// ファイルを選び、[parse] で BackupData に変換して、確認ダイアログのあと、取り込む。
+  // ── 読み込み(このアプリのバックアップ / 本家 Simplenote の書き出し / Dropbox のバックアップ 共通) ──
+  /// ファイルを取得し([load]。省略すると、端末のファイル選択)、[parse] で BackupData に変換して、
+  /// 確認ダイアログのあと、取り込む。
   Future<void> _importFile(
     BackupData Function(Uint8List bytes) parse, {
     required String title,
+    Future<Uint8List?> Function()? load,
   }) async {
     setState(() => _busy = true);
     try {
-      final bytes = await pickBackupFile();
+      final bytes = await (load ?? pickBackupFile)();
       if (bytes == null) return; // キャンセル
 
       final BackupData data;
@@ -102,6 +118,48 @@ class _SettingsScreenState extends State<SettingsScreen> {
         parseSimplenoteExport,
         title: '本家 Simplenote から取り込む',
       );
+
+  // ── Dropbox へのバックアップ・復元 ───────────────────────────
+  Future<void> _backupNow() async {
+    setState(() => _busy = true);
+    try {
+      final n = await widget.store.backupNow();
+      _snack('$n件のノートを、Dropbox の backup フォルダに保存しました');
+    } catch (e) {
+      _snack('バックアップに失敗しました: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _restoreFromDropbox() async {
+    setState(() => _busy = true);
+    List<BackupFileInfo>? files;
+    try {
+      files = await widget.store.listRemoteBackups();
+    } catch (e) {
+      _snack('バックアップの一覧を取得できませんでした: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+    if (files == null || !mounted) return;
+    if (files.isEmpty) {
+      _snack('Dropbox の backup フォルダに、バックアップがありません');
+      return;
+    }
+
+    final picked = await showDialog<BackupFileInfo>(
+      context: context,
+      builder: (_) => _BackupPickDialog(files: files!),
+    );
+    if (picked == null) return;
+
+    await _importFile(
+      (bytes) => parseBackup(utf8.decode(bytes)),
+      title: 'Dropbox のバックアップから復元',
+      load: () => widget.store.downloadRemoteBackup(picked.path),
+    );
+  }
 
   // ── 一覧の作り直し ───────────────────────────────────────────
   Future<void> _rebuildIndex() async {
@@ -189,6 +247,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   Widget build(BuildContext context) {
     final current = NotesApp.of(context).themeKind;
+    final lastBackup = widget.store.lastBackupDate;
     return Scaffold(
       appBar: AppBar(
         title: const Text('設定'),
@@ -209,6 +268,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 for (final k in AppThemeKind.values) _themeTile(k, current),
                 const Divider(height: 24),
                 _sectionTitle('バックアップ'),
+                ListTile(
+                  leading: const Icon(Icons.cloud_sync_outlined),
+                  title: const Text('Dropbox への自動バックアップ'),
+                  subtitle: Text(
+                      '1日1回、同期のあとに、Dropbox の backup フォルダへ保存します(最大${NotesStore.backupKeep}件)。'
+                      '最後のバックアップ: ${lastBackup ?? 'まだありません'}'),
+                ),
+                ListTile(
+                  enabled: !_busy,
+                  leading: const Icon(Icons.cloud_upload_outlined),
+                  title: const Text('今すぐ Dropbox にバックアップ'),
+                  subtitle: const Text('全ノート(ゴミ箱内も含む)を、いま保存します'),
+                  onTap: _busy ? null : _backupNow,
+                ),
+                ListTile(
+                  enabled: !_busy,
+                  leading: const Icon(Icons.settings_backup_restore),
+                  title: const Text('Dropbox のバックアップから復元'),
+                  subtitle: const Text('backup フォルダのバックアップを選んで、ノートを戻します'),
+                  onTap: _busy ? null : _restoreFromDropbox,
+                ),
                 ListTile(
                   enabled: !_busy,
                   leading: const Icon(Icons.file_download_outlined),
@@ -252,6 +332,40 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Dropbox のバックアップを選ぶダイアログ(新しい順)。選んだものを返す。
+class _BackupPickDialog extends StatelessWidget {
+  final List<BackupFileInfo> files;
+  const _BackupPickDialog({required this.files});
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('復元するバックアップ(新しい順)'),
+      content: SizedBox(
+        width: 360,
+        height: 420,
+        child: ListView.builder(
+          itemCount: files.length,
+          itemBuilder: (context, i) {
+            final f = files[i];
+            return ListTile(
+              dense: true,
+              title: Text(_fmtDt(f.modifiedMs)),
+              subtitle: Text(_fmtSize(f.size)),
+              onTap: () => Navigator.pop(context, f),
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('キャンセル')),
+      ],
     );
   }
 }

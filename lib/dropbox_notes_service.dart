@@ -3,6 +3,7 @@
 // Dropbox 上のレイアウト(アプリフォルダ配下):
 //   /simplenote/index.json        … 全ノートのメタ情報(タイトル・プレビュー・ピン・ゴミ箱・日時)と、タグの並び順(tagOrder)
 //   /simplenote/notes/<id>.txt    … ノート本文(プレーンテキスト)
+//   /backup/simplenote_backup_YYYYMMDD_HHmmss.json … 自動・手動バックアップ(v17。最大365件)
 //
 // 全文検索用に、全ノートの本文を ZIP で一括取得する (downloadAllNotes)。
 //
@@ -10,6 +11,7 @@
 // 他の端末と同時に更新して競合した場合は、取得し直して自分の変更だけを再適用する。
 
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:http/http.dart' as http;
@@ -19,6 +21,12 @@ import 'dropbox_auth_service.dart';
 const _root = '/simplenote';
 const _indexPath = '$_root/index.json';
 const _notesDir = '$_root/notes';
+
+/// バックアップの保存先(アプリフォルダの直下。Scratchpad・BulletMemo と同じ)
+const _backupDir = '/backup';
+
+/// バックアップのファイル名の先頭(この名前のファイルだけを、一覧・削除の対象にする)
+const _backupPrefix = 'simplenote_backup_';
 
 // ──────────────────────────────────────────────────────────────
 // モデル
@@ -139,6 +147,15 @@ class NoteFileInfo {
   final String id;
   final int modifiedMs; // ファイルの更新日時 (ms)
   const NoteFileInfo(this.id, this.modifiedMs);
+}
+
+/// Dropbox の backup フォルダにあるバックアップファイル1つ分の情報
+class BackupFileInfo {
+  final String path; // Dropbox 上のパス(ダウンロード・削除に使う)
+  final String name; // ファイル名
+  final int modifiedMs; // Dropbox 上の更新日時 (ms)
+  final int size; // バイト数
+  const BackupFileInfo(this.path, this.name, this.modifiedMs, this.size);
 }
 
 class IndexSnapshot {
@@ -410,5 +427,118 @@ class DropboxNotesService {
     if (resp.statusCode != 200 && !alreadyGone) {
       throw Exception('note delete error ${resp.statusCode}: ${resp.body}');
     }
+  }
+
+  // ── バックアップ(/backup フォルダ) ───────────────────────────
+
+  /// バックアップを、backup フォルダに新しいファイルとして保存する。
+  /// 日時つきの新規ファイルなので、複数の端末が同じ日に保存しても、上書きしない。
+  Future<void> uploadBackup(String fileName, List<int> bytes) async {
+    final token = await _token();
+    final resp = await http.post(
+      Uri.parse('https://content.dropboxapi.com/2/files/upload'),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Content-Type': 'application/octet-stream',
+        'Dropbox-API-Arg': jsonEncode({
+          'path': '$_backupDir/$fileName',
+          'mode': 'add',
+          'autorename': true, // 同じ名前があっても、別名で保存する(上書きしない)
+          'mute': true,
+        }),
+      },
+      body: bytes,
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('backup upload error ${resp.statusCode}: ${resp.body}');
+    }
+  }
+
+  /// backup フォルダにあるバックアップの一覧(新しい順)。フォルダが無ければ空。
+  /// このアプリが作った名前(simplenote_backup_*.json)のファイルだけを返す。
+  Future<List<BackupFileInfo>> listBackups() async {
+    final token = await _token();
+    final out = <BackupFileInfo>[];
+    String? cursor;
+    while (true) {
+      final resp = await http.post(
+        Uri.parse(cursor == null
+            ? 'https://api.dropboxapi.com/2/files/list_folder'
+            : 'https://api.dropboxapi.com/2/files/list_folder/continue'),
+        headers: {
+          'Authorization': 'Bearer $token',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode(cursor == null
+            ? {'path': _backupDir, 'limit': 2000}
+            : {'cursor': cursor}),
+      );
+      if (resp.statusCode == 409 && resp.body.contains('not_found')) {
+        return out; // まだ backup フォルダが無い
+      }
+      if (resp.statusCode != 200) {
+        throw Exception('backup list error ${resp.statusCode}: ${resp.body}');
+      }
+      final data = jsonDecode(resp.body) as Map<String, dynamic>;
+      for (final e in (data['entries'] as List)) {
+        final m = e as Map<String, dynamic>;
+        if (m['.tag'] != 'file') continue;
+        final name = m['name'] as String;
+        if (!name.startsWith(_backupPrefix) || !name.endsWith('.json')) continue;
+        final t = DateTime.tryParse(
+            (m['server_modified'] ?? m['client_modified'] ?? '') as String);
+        out.add(BackupFileInfo(
+          (m['path_display'] as String?) ?? '$_backupDir/$name',
+          name,
+          (t ?? DateTime.fromMillisecondsSinceEpoch(0)).millisecondsSinceEpoch,
+          (m['size'] as num?)?.toInt() ?? 0,
+        ));
+      }
+      if (data['has_more'] != true) break;
+      cursor = data['cursor'] as String;
+    }
+    out.sort((a, b) => b.modifiedMs.compareTo(a.modifiedMs)); // 新しい順
+    return out;
+  }
+
+  /// バックアップファイルの中身を取得する。
+  Future<Uint8List> downloadBackup(String path) async {
+    final token = await _token();
+    final resp = await http.post(
+      Uri.parse('https://content.dropboxapi.com/2/files/download'),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Dropbox-API-Arg': jsonEncode({'path': path}),
+      },
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('backup download error ${resp.statusCode}: ${resp.body}');
+    }
+    return resp.bodyBytes;
+  }
+
+  /// バックアップが [keep] 件を超えていたら、古いものから削除する。削除した件数を返す。
+  /// 書き込みの混雑などで削除に失敗したら、そこで止めて、次の機会に続きをやる。
+  Future<int> pruneBackups({int keep = 365}) async {
+    final all = await listBackups(); // 新しい順
+    if (all.length <= keep) return 0;
+    final token = await _token();
+    var deleted = 0;
+    for (final f in all.sublist(keep).reversed) {
+      // 古いものから
+      final resp = await http.post(
+        Uri.parse('https://api.dropboxapi.com/2/files/delete_v2'),
+        headers: {
+          'Authorization': 'Bearer $token',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({'path': f.path}),
+      );
+      final alreadyGone =
+          resp.statusCode == 409 && resp.body.contains('not_found');
+      if (resp.statusCode != 200 && !alreadyGone) break;
+      deleted++;
+    }
+    return deleted;
   }
 }
