@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -712,6 +713,114 @@ class _NotesListScreenState extends State<NotesListScreen>
               ],
             );
 
+            // ── 一覧の行 ──
+            // Web 版は、ホバーやインクの効果を持たない軽い行にする(スクロールを、なめらかにするため)。
+            // Android は、従来どおり ListTile(タップの波紋つき)。
+            final titleStyle = Theme.of(context)
+                .textTheme
+                .titleMedium
+                ?.copyWith(fontWeight: FontWeight.bold);
+            final subStyle = Theme.of(context)
+                .textTheme
+                .bodyMedium
+                ?.copyWith(color: scheme.onSurfaceVariant);
+
+            Widget buildRow(int i) {
+              final n = notes[i];
+              // 検索語が本文にだけあるときは、その前後を抜粋して表示する
+              final snippet = q.isEmpty ? null : store.bodySnippet(n.id, q);
+              final subText = snippet ?? n.preview;
+              final hasPreview = subText.isNotEmpty;
+              final isOpen = wide && n.id == _openId;
+
+              final titleW = _hlText(
+                n.title.isEmpty ? '(無題)' : n.title,
+                q,
+                hlColor: scheme.tertiaryContainer,
+                hlTextColor: scheme.onTertiaryContainer,
+                style: titleStyle,
+              );
+              final subW = hasPreview
+                  ? _hlText(
+                      subText,
+                      q,
+                      hlColor: scheme.tertiaryContainer,
+                      hlTextColor: scheme.onTertiaryContainer,
+                      style: subStyle,
+                      maxLines: 2,
+                    )
+                  : null;
+
+              // 検索中なら、本文内の一致箇所を強調する
+              void open() => _openNote(n.id, wide: wide, query: q);
+
+              if (kIsWeb) {
+                return MouseRegion(
+                  cursor: SystemMouseCursors.click,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: open,
+                    child: Container(
+                      color: isOpen ? scheme.secondaryContainer : null,
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 14),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                titleW,
+                                if (subW != null) ...[
+                                  const SizedBox(height: 4),
+                                  subW,
+                                ],
+                              ],
+                            ),
+                          ),
+                          if (n.pinned)
+                            const Padding(
+                              padding: EdgeInsets.only(left: 8, top: 2),
+                              child: Icon(Icons.push_pin, size: 18),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              }
+
+              return ListTile(
+                tileColor: isOpen ? scheme.secondaryContainer : null,
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                isThreeLine: hasPreview,
+                title: titleW,
+                subtitle: subW,
+                trailing: n.pinned ? const Icon(Icons.push_pin, size: 18) : null,
+                onTap: open,
+              );
+            }
+
+            // ── 一覧のスクロール部分 ──
+            final Widget scrollable = notes.isEmpty
+                ? ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    children: const [
+                      SizedBox(height: 120),
+                      Center(child: Text('ノートはありません')),
+                    ],
+                  )
+                : ListView.builder(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.only(bottom: 88),
+                    // 画面の外の行も、先に作っておく(スクロール中に作る負荷を、減らすため)
+                    cacheExtent: 1500,
+                    itemCount: notes.length,
+                    itemBuilder: (context, i) => buildRow(i),
+                  );
+
             // ── 一覧の本体 ──
             final listBody = Column(
               children: [
@@ -737,72 +846,13 @@ class _NotesListScreenState extends State<NotesListScreen>
                 Expanded(
                   child: store.loading && notes.isEmpty
                       ? const Center(child: CircularProgressIndicator())
-                      : RefreshIndicator(
-                          onRefresh: () => store.refresh(force: true),
-                          child: notes.isEmpty
-                              ? ListView(
-                                  physics: const AlwaysScrollableScrollPhysics(),
-                                  children: const [
-                                    SizedBox(height: 120),
-                                    Center(child: Text('ノートはありません')),
-                                  ],
-                                )
-                              : ListView.builder(
-                                  physics: const AlwaysScrollableScrollPhysics(),
-                                  padding: const EdgeInsets.only(bottom: 88),
-                                  itemCount: notes.length,
-                                  itemBuilder: (context, i) {
-                                    final n = notes[i];
-                                    // 検索語が本文にだけあるときは、その前後を抜粋して表示する
-                                    final snippet = q.isEmpty
-                                        ? null
-                                        : store.bodySnippet(n.id, q);
-                                    final subText = snippet ?? n.preview;
-                                    final hasPreview = subText.isNotEmpty;
-                                    final isOpen = wide && n.id == _openId;
-                                    return ListTile(
-                                      tileColor: isOpen
-                                          ? scheme.secondaryContainer
-                                          : null,
-                                      contentPadding:
-                                          const EdgeInsets.symmetric(
-                                              horizontal: 16, vertical: 6),
-                                      isThreeLine: hasPreview,
-                                      title: _hlText(
-                                        n.title.isEmpty ? '(無題)' : n.title,
-                                        q,
-                                        hlColor: scheme.tertiaryContainer,
-                                        hlTextColor:
-                                            scheme.onTertiaryContainer,
-                                        style: Theme.of(context)
-                                            .textTheme
-                                            .titleMedium
-                                            ?.copyWith(
-                                                fontWeight: FontWeight.bold),
-                                      ),
-                                      subtitle: hasPreview
-                                          ? _hlText(
-                                              subText,
-                                              q,
-                                              hlColor: scheme.tertiaryContainer,
-                                              hlTextColor:
-                                                  scheme.onTertiaryContainer,
-                                              maxLines: 2,
-                                            )
-                                          : null,
-                                      trailing: n.pinned
-                                          ? const Icon(Icons.push_pin, size: 18)
-                                          : null,
-                                      // 検索中なら、本文内の一致箇所を強調する
-                                      onTap: () => _openNote(
-                                        n.id,
-                                        wide: wide,
-                                        query: q,
-                                      ),
-                                    );
-                                  },
-                                ),
-                        ),
+                      // Web 版は、引っ張って更新を使わない(同期は右上の雲のボタン)
+                      : (kIsWeb
+                          ? scrollable
+                          : RefreshIndicator(
+                              onRefresh: () => store.refresh(force: true),
+                              child: scrollable,
+                            )),
                 ),
               ],
             );
