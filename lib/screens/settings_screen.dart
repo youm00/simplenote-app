@@ -248,6 +248,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget build(BuildContext context) {
     final current = NotesApp.of(context).themeKind;
     final lastBackup = widget.store.lastBackupDate;
+    final keepText = NotesStore.backupKeep > 0
+        ? '最大${NotesStore.backupKeep}件'
+        : '古いものも削除せず、すべて残します';
     return Scaffold(
       appBar: AppBar(
         title: const Text('設定'),
@@ -272,7 +275,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   leading: const Icon(Icons.cloud_sync_outlined),
                   title: const Text('Dropbox への自動バックアップ'),
                   subtitle: Text(
-                      '1日1回、同期のあとに、Dropbox の backup フォルダへ保存します(最大${NotesStore.backupKeep}件)。'
+                      '1日1回、同期のあとに、Dropbox の backup フォルダへ保存します($keepText)。'
                       '最後のバックアップ: ${lastBackup ?? 'まだありません'}'),
                 ),
                 ListTile(

@@ -13,7 +13,7 @@
 //  - バックアップ: 全ノートを JSON で書き出す(buildBackup)/読み込む(importBackup)。
 //    読み込んだノートは、本文ファイルを4件ずつ並行して送り、index.json は1回の更新でまとめて送る。
 //  - 自動バックアップ(v17): 同期が成功したあと、今日まだ取っていなければ、Dropbox の /backup/ に
-//    simplenote_backup_YYYYMMDD_HHmmss.json を保存する(1日1回、最大365件)。
+//    simplenote_backup_YYYYMMDD_HHmmss.json を保存する(1日1回。古いものも削除せず、すべて残す)。
 //    ほかの端末が、今日すでに取っていたときは(backup フォルダに今日の日付のファイルがあるとき)、取らない。
 //    手動の保存(backupNow)と、Dropbox のバックアップの一覧・取得(listRemoteBackups / downloadRemoteBackup)も、
 //    ここから行う。
@@ -102,8 +102,9 @@ class NotesStore extends ChangeNotifier {
   static const _zipThreshold = 8; // 取得が必要なノートがこの数以上なら、ZIP でまとめて取得
 
   // 自動バックアップの状態(v17)
-  /// Dropbox に残すバックアップの最大件数(超えた分は、古い順に自動で削除する)
-  static const backupKeep = 365;
+  /// Dropbox に残すバックアップの最大件数。0 以下なら、無制限(古いものも削除しない)。
+  /// 件数で制限したいときは、365 などの数にする(超えた分は、古い順に自動で削除する)。
+  static const backupKeep = 0;
   static const _backupDateKey = 'sn_cache_last_backup'; // ログアウトで、端末内の保存といっしょに消える
   static const _backupRetryWait = Duration(minutes: 10);
   bool _backingUp = false;
@@ -596,7 +597,7 @@ class NotesStore extends ChangeNotifier {
   // ── Dropbox へのバックアップ(v17) ────────────────────────────
 
   /// いま、全ノートのバックアップを、Dropbox の /backup/ に保存する(手動・自動の共通)。
-  /// 保存したノートの数を返す。失敗したら、例外。保存したあと、365件を超えた古い分を削除する。
+  /// 保存したノートの数を返す。失敗したら、例外。[backupKeep] が正の数なら、保存したあと、それを超えた古い分を削除する。
   /// ここでは、今日の分があるかどうかは確かめない(確かめるのは、自動のほう)。
   Future<int> backupNow() async {
     if (_backingUp) throw Exception('別のバックアップを実行中です');
@@ -609,9 +610,11 @@ class NotesStore extends ChangeNotifier {
       final bytes = utf8.encode(encodeBackup(data));
       await _svc.uploadBackup(_backupFileName(now), bytes);
       await _recordBackupDate(_dateStr(now));
-      try {
-        await _svc.pruneBackups(keep: backupKeep); // 古い分の削除に失敗しても、バックアップ自体は成功
-      } catch (_) {}
+      if (backupKeep > 0) {
+        try {
+          await _svc.pruneBackups(keep: backupKeep); // 古い分の削除に失敗しても、バックアップ自体は成功
+        } catch (_) {}
+      }
       return data.notes.length;
     } finally {
       _backingUp = false;

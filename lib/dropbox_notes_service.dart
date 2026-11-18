@@ -3,7 +3,7 @@
 // Dropbox 上のレイアウト(アプリフォルダ配下):
 //   /simplenote/index.json        … 全ノートのメタ情報(タイトル・プレビュー・ピン・ゴミ箱・日時)と、タグの並び順(tagOrder)
 //   /simplenote/notes/<id>.txt    … ノート本文(プレーンテキスト)
-//   /backup/simplenote_backup_YYYYMMDD_HHmmss.json … 自動・手動バックアップ(v17。最大365件)
+//   /backup/simplenote_backup_YYYYMMDD_HHmmss.json … 自動・手動バックアップ(v17。削除せず、すべて残す)
 //
 // 全文検索用に、全ノートの本文を ZIP で一括取得する (downloadAllNotes)。
 //
@@ -518,8 +518,10 @@ class DropboxNotesService {
   }
 
   /// バックアップが [keep] 件を超えていたら、古いものから削除する。削除した件数を返す。
+  /// [keep] が 0 以下なら、何も削除しない(無制限)。
   /// 書き込みの混雑などで削除に失敗したら、そこで止めて、次の機会に続きをやる。
   Future<int> pruneBackups({int keep = 365}) async {
+    if (keep <= 0) return 0;
     final all = await listBackups(); // 新しい順
     if (all.length <= keep) return 0;
     final token = await _token();
